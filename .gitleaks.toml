@@ -1,0 +1,11 @@
+# Gitleaks configuration for mcp library
+# Exclude example files which contain intentional demo credentials
+
+[extend]
+useDefault = true
+
+[allowlist]
+paths = [
+    '''examples/.*''',
+    '''tests/.*''',
+]

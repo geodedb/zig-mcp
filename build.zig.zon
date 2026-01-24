@@ -1,0 +1,20 @@
+.{
+    .name = .mcp,
+    .version = "0.1.0",
+    .fingerprint = 0x777244a91e9d0b5d,
+    .minimum_zig_version = "0.15.0",
+    .dependencies = .{
+        .json = .{
+            .path = "deps/json",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "tests",
+        "deps",
+        "LICENSE",
+        "README.md",
+    },
+}
