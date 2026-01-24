@@ -2,6 +2,14 @@
 
 A Zig 0.15.2 implementation of the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) spec revision 2025-03-26.
 
+## Status
+
+| Aspect | Info |
+|--------|------|
+| API Stability | Beta |
+| Zig Version | 0.15.2+ |
+| Platforms | Linux, macOS, Windows |
+
 ## Features
 
 - **JSON-RPC 2.0** - Single and batch message support, string/integer IDs
