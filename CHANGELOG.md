@@ -7,18 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-- Merge request template for contributions
-- Issue templates for bug reports, features, and questions
-
-### Changed
-- Updated CI catalog components to v1.7.1
-
-## [0.1.0] - 2026-01-23
+## [0.1.0] - 2026-01-24
 
 Initial open source release of the MCP Server Library for Zig.
 
 ### Added
+- Merge request template for contributions
+- Issue templates for bug reports, features, and questions
 - **Core Protocol Support**
   - JSON-RPC 2.0 with single and batch message support
   - String and integer ID support
@@ -71,6 +66,10 @@ Initial open source release of the MCP Server Library for Zig.
 - Windows args compatibility in fuzz testing
 - PowerShell variable expansion in Windows CI builds
 - Zig 0.15 `std.Io.Reader` interface compatibility
+
+### Changed
+- Updated CI catalog components to v1.7.1
+- Updated json dependency to use GitLab archive URL
 
 ### Security
 - Gitleaks allowlist configuration for test data

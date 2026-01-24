@@ -1,11 +1,12 @@
 .{
     .name = .mcp,
     .version = "0.1.0",
-    .fingerprint = 0x777244a91e9d0b5d,
+    .fingerprint = 0xa19bc839041e107b,
     .minimum_zig_version = "0.15.0",
     .dependencies = .{
         .json = .{
-            .path = "deps/json",
+            .url = "https://gitlab.com/devnw/zig/json/-/archive/v0.1.0/json-v0.1.0.tar.gz",
+            .hash = "json-0.1.0-tOue4WZ_CwDmY9dvdVfuFN_LcZZs6XcHmnQqkvsqdNCM",
         },
     },
     .paths = .{
@@ -13,7 +14,6 @@
         "build.zig.zon",
         "src",
         "tests",
-        "deps",
         "LICENSE",
         "README.md",
     },
