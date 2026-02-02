@@ -6,6 +6,47 @@
 //! Provides high-performance parallel implementations for MCP operations
 //! including JSON-RPC batch processing, SSE broadcasting, tool execution,
 //! and resource reading.
+//!
+//! ## Overview
+//!
+//! This module enables parallel processing of Model Context Protocol
+//! operations using the spice thread pool. Ideal for MCP servers handling
+//! multiple clients or batch requests.
+//!
+//! ## Build Configuration
+//!
+//! Enable: `-Dspice=true` (default)
+//! Disable: `-Dspice=false`
+//!
+//! ## Usage Example
+//!
+//! ```zig
+//! const parallel = @import("parallel.zig");
+//!
+//! // Execute multiple tool calls in parallel
+//! var calls: [4]parallel.ToolCall = undefined;
+//! var results: [4]parallel.ToolResult = undefined;
+//!
+//! for (&calls) |*call| {
+//!     call.* = .{
+//!         .name = "read_file",
+//!         .arguments = "{\"path\": \"/tmp/test.txt\"}",
+//!         .call_id = generateId(),
+//!     };
+//! }
+//!
+//! parallel.parallelToolExecute(allocator, &calls, &results, myToolExecutor);
+//! ```
+//!
+//! ## Performance Thresholds
+//!
+//! | Operation        | Threshold   | Sequential Below |
+//! |------------------|-------------|------------------|
+//! | Batch Process    | 4 requests  | Yes              |
+//! | SSE Broadcast    | 8 clients   | Yes              |
+//! | Tool Execute     | 2 calls     | Yes              |
+//! | Resource Read    | 2 resources | Yes              |
+//! | Prompt Render    | 4 templates | Yes              |
 
 const std = @import("std");
 const build_options = @import("build_options");
@@ -653,5 +694,198 @@ test "parallel sse broadcast" {
 
     for (results) |result| {
         try std.testing.expect(result.success);
+    }
+}
+
+test "parallel sse broadcast - inactive clients" {
+    if (!build_options.enable_spice) return error.SkipZigTest;
+
+    var clients: [8]SseClient = undefined;
+    var results: [8]SseSendResult = undefined;
+
+    for (&clients, 0..) |*client, i| {
+        client.* = .{
+            .client_id = i,
+            .last_event_id = null,
+            .active = false, // Inactive
+        };
+    }
+
+    const event = SseEvent{
+        .event_type = "notification",
+        .data = "data",
+        .event_id = 2,
+    };
+
+    parallelSseBroadcast(&clients, event, &results, testSender);
+
+    for (results) |result| {
+        try std.testing.expect(!result.success);
+    }
+}
+
+fn testExecutor(call: ToolCall, allocator: std.mem.Allocator) ToolResult {
+    _ = allocator;
+    return .{
+        .call_id = call.call_id,
+        .success = call.name.len > 0,
+        .output = null,
+        .error_msg = null,
+    };
+}
+
+test "parallel tool execute" {
+    if (!build_options.enable_spice) return error.SkipZigTest;
+
+    var calls: [4]ToolCall = undefined;
+    var results: [4]ToolResult = undefined;
+
+    for (&calls) |*call| {
+        call.* = .{
+            .name = "test_tool",
+            .arguments = null,
+            .call_id = "call-1",
+        };
+    }
+
+    parallelToolExecute(std.testing.allocator, &calls, &results, testExecutor);
+
+    for (results) |result| {
+        try std.testing.expect(result.success);
+    }
+}
+
+test "parallel tool execute - empty name" {
+    if (!build_options.enable_spice) return error.SkipZigTest;
+
+    var calls: [4]ToolCall = undefined;
+    var results: [4]ToolResult = undefined;
+
+    for (&calls) |*call| {
+        call.* = .{
+            .name = "", // Empty
+            .arguments = null,
+            .call_id = "call-1",
+        };
+    }
+
+    parallelToolExecute(std.testing.allocator, &calls, &results, testExecutor);
+
+    for (results) |result| {
+        try std.testing.expect(!result.success);
+    }
+}
+
+fn testReader(request: ResourceReadRequest, allocator: std.mem.Allocator) ResourceReadResult {
+    _ = allocator;
+    return .{
+        .uri = request.uri,
+        .success = request.uri.len > 0,
+        .content = null,
+        .mime_type = request.mime_type,
+        .error_msg = null,
+    };
+}
+
+test "parallel resource read" {
+    if (!build_options.enable_spice) return error.SkipZigTest;
+
+    var requests: [4]ResourceReadRequest = undefined;
+    var results: [4]ResourceReadResult = undefined;
+
+    for (&requests) |*request| {
+        request.* = .{
+            .uri = "file:///path/to/resource",
+            .mime_type = "text/plain",
+        };
+    }
+
+    parallelResourceRead(std.testing.allocator, &requests, &results, testReader);
+
+    for (results) |result| {
+        try std.testing.expect(result.success);
+    }
+}
+
+test "parallel prompt render" {
+    if (!build_options.enable_spice) return error.SkipZigTest;
+
+    var templates: [8]PromptTemplate = undefined;
+    var variables: [8]PromptVariables = undefined;
+    var results: [8]PromptRenderResult = undefined;
+
+    for (&templates, 0..) |*tmpl, i| {
+        _ = i;
+        tmpl.* = .{
+            .name = "greeting",
+            .template = "Hello, {{name}}!",
+            .variables = &[_][]const u8{"name"},
+        };
+    }
+
+    for (&variables) |*vars| {
+        vars.* = .{
+            .values = &[_][]const u8{"World"},
+        };
+    }
+
+    parallelPromptRender(std.testing.allocator, &templates, &variables, &results);
+
+    for (results) |result| {
+        try std.testing.expect(result.success);
+        if (result.rendered) |r| std.testing.allocator.free(r);
+    }
+}
+
+test "parallel prompt render - empty template" {
+    if (!build_options.enable_spice) return error.SkipZigTest;
+
+    var templates: [4]PromptTemplate = undefined;
+    var variables: [4]PromptVariables = undefined;
+    var results: [4]PromptRenderResult = undefined;
+
+    for (&templates) |*tmpl| {
+        tmpl.* = .{
+            .name = "empty",
+            .template = "", // Empty
+            .variables = &[_][]const u8{},
+        };
+    }
+
+    for (&variables) |*vars| {
+        vars.* = .{ .values = &[_][]const u8{} };
+    }
+
+    parallelPromptRender(std.testing.allocator, &templates, &variables, &results);
+
+    for (results) |result| {
+        try std.testing.expect(!result.success);
+    }
+}
+
+test "parallel prompt render - variable mismatch" {
+    if (!build_options.enable_spice) return error.SkipZigTest;
+
+    var templates: [4]PromptTemplate = undefined;
+    var variables: [4]PromptVariables = undefined;
+    var results: [4]PromptRenderResult = undefined;
+
+    for (&templates) |*tmpl| {
+        tmpl.* = .{
+            .name = "test",
+            .template = "Hello {{a}} {{b}}",
+            .variables = &[_][]const u8{ "a", "b" }, // 2 variables
+        };
+    }
+
+    for (&variables) |*vars| {
+        vars.* = .{ .values = &[_][]const u8{"only_one"} }; // Only 1 value
+    }
+
+    parallelPromptRender(std.testing.allocator, &templates, &variables, &results);
+
+    for (results) |result| {
+        try std.testing.expect(!result.success);
+        try std.testing.expect(result.error_msg != null);
     }
 }
