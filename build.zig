@@ -7,6 +7,22 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Spice parallelism option
+    const enable_spice = b.option(bool, "spice", "Enable spice-based parallelism") orelse true;
+
+    // Build options module
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "enable_spice", enable_spice);
+
+    // Get spice dependency if enabled
+    const spice_mod: ?*std.Build.Module = if (enable_spice) blk: {
+        const spice_dep = b.dependency("spice", .{
+            .target = target,
+            .optimize = optimize,
+        });
+        break :blk spice_dep.module("spice");
+    } else null;
+
     // External Dependencies
     const json_dep = b.dependency("json", .{
         .target = target,
@@ -49,6 +65,19 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Parallel module
+    const parallel_mod = b.addModule("parallel", .{
+        .root_source_file = b.path("src/parallel.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "build_options", .module = build_options.createModule() },
+        },
+    });
+    if (spice_mod) |sm| {
+        parallel_mod.addImport("spice", sm);
+    }
+
     // Main MCP module
     const mcp_mod = b.addModule("mcp", .{
         .root_source_file = b.path("src/mcp.zig"),
@@ -56,6 +85,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "json", .module = json_mod },
+            .{ .name = "parallel", .module = parallel_mod },
         },
     });
 
