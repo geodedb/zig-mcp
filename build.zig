@@ -73,7 +73,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
-            .{ .name = "build_options", .module = build_options.createModule() },
+            .{ .name = "mcp_build_options", .module = build_options.createModule() },
         },
     });
     if (spice_mod) |sm| {

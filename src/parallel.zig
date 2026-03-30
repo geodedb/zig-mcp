@@ -49,7 +49,7 @@
 //! | Prompt Render    | 4 templates | Yes              |
 
 const std = @import("std");
-const build_options = @import("build_options");
+const build_options = @import("mcp_build_options");
 
 const spice = if (build_options.enable_spice) @import("spice") else struct {
     pub const ThreadPool = void;
