@@ -49,9 +49,8 @@
 //! | Prompt Render    | 4 templates | Yes              |
 
 const std = @import("std");
-const build_options = @import("mcp_build_options");
 
-const spice = if (build_options.enable_spice) @import("spice") else struct {
+const spice = if (true) @import("spice") else struct {
     pub const ThreadPool = void;
     pub const Task = void;
     pub fn Future(comptime I: type, comptime O: type) type {
@@ -65,11 +64,11 @@ const spice = if (build_options.enable_spice) @import("spice") else struct {
 // Global Thread Pool
 // ============================================================================
 
-var global_pool: if (build_options.enable_spice) ?spice.ThreadPool else void = if (build_options.enable_spice) null else {};
+var global_pool: if (true) ?spice.ThreadPool else void = if (true) null else {};
 var pool_mutex: std.Thread.Mutex = .{};
 
-pub fn getPool() if (build_options.enable_spice) *spice.ThreadPool else void {
-    if (!build_options.enable_spice) return;
+pub fn getPool() if (true) *spice.ThreadPool else void {
+    // spice always enabled when this module is compiled
 
     pool_mutex.lock();
     defer pool_mutex.unlock();
@@ -82,7 +81,7 @@ pub fn getPool() if (build_options.enable_spice) *spice.ThreadPool else void {
 }
 
 pub fn deinitPool() void {
-    if (!build_options.enable_spice) return;
+    // spice always enabled when this module is compiled
 
     pool_mutex.lock();
     defer pool_mutex.unlock();
@@ -143,7 +142,7 @@ pub fn parallelBatchProcess(
 ) void {
     std.debug.assert(requests.len == responses.len);
 
-    if (!build_options.enable_spice or requests.len < 4) {
+    if (!true or requests.len < 4) {
         for (requests, 0..) |request, i| {
             responses[i] = handler(request, allocator);
         }
@@ -250,7 +249,7 @@ pub fn parallelSseBroadcast(
 ) void {
     std.debug.assert(clients.len == results.len);
 
-    if (!build_options.enable_spice or clients.len < 8) {
+    if (!true or clients.len < 8) {
         for (clients, 0..) |client, i| {
             results[i] = sender(client, event);
         }
@@ -351,7 +350,7 @@ pub fn parallelToolExecute(
 ) void {
     std.debug.assert(calls.len == results.len);
 
-    if (!build_options.enable_spice or calls.len < 2) {
+    if (!true or calls.len < 2) {
         for (calls, 0..) |call, i| {
             results[i] = executor(call, allocator);
         }
@@ -452,7 +451,7 @@ pub fn parallelResourceRead(
 ) void {
     std.debug.assert(requests.len == results.len);
 
-    if (!build_options.enable_spice or requests.len < 2) {
+    if (!true or requests.len < 2) {
         for (requests, 0..) |request, i| {
             results[i] = reader(request, allocator);
         }
@@ -555,7 +554,7 @@ pub fn parallelPromptRender(
     std.debug.assert(templates.len == variables.len);
     std.debug.assert(templates.len == results.len);
 
-    if (!build_options.enable_spice or templates.len < 4) {
+    if (!true or templates.len < 4) {
         for (templates, 0..) |template, i| {
             results[i] = renderPrompt(allocator, template, variables[i]);
         }
@@ -640,7 +639,7 @@ fn testHandler(request: JsonRpcRequest, allocator: std.mem.Allocator) JsonRpcRes
 }
 
 test "parallel batch process" {
-    if (!build_options.enable_spice) return error.SkipZigTest;
+    // spice always enabled when this module is compiled
 
     var requests: [8]JsonRpcRequest = undefined;
     var responses: [8]JsonRpcResponse = undefined;
@@ -671,7 +670,7 @@ fn testSender(client: SseClient, event: SseEvent) SseSendResult {
 }
 
 test "parallel sse broadcast" {
-    if (!build_options.enable_spice) return error.SkipZigTest;
+    // spice always enabled when this module is compiled
 
     var clients: [16]SseClient = undefined;
     var results: [16]SseSendResult = undefined;
@@ -698,7 +697,7 @@ test "parallel sse broadcast" {
 }
 
 test "parallel sse broadcast - inactive clients" {
-    if (!build_options.enable_spice) return error.SkipZigTest;
+    // spice always enabled when this module is compiled
 
     var clients: [8]SseClient = undefined;
     var results: [8]SseSendResult = undefined;
@@ -735,7 +734,7 @@ fn testExecutor(call: ToolCall, allocator: std.mem.Allocator) ToolResult {
 }
 
 test "parallel tool execute" {
-    if (!build_options.enable_spice) return error.SkipZigTest;
+    // spice always enabled when this module is compiled
 
     var calls: [4]ToolCall = undefined;
     var results: [4]ToolResult = undefined;
@@ -756,7 +755,7 @@ test "parallel tool execute" {
 }
 
 test "parallel tool execute - empty name" {
-    if (!build_options.enable_spice) return error.SkipZigTest;
+    // spice always enabled when this module is compiled
 
     var calls: [4]ToolCall = undefined;
     var results: [4]ToolResult = undefined;
@@ -788,7 +787,7 @@ fn testReader(request: ResourceReadRequest, allocator: std.mem.Allocator) Resour
 }
 
 test "parallel resource read" {
-    if (!build_options.enable_spice) return error.SkipZigTest;
+    // spice always enabled when this module is compiled
 
     var requests: [4]ResourceReadRequest = undefined;
     var results: [4]ResourceReadResult = undefined;
@@ -808,7 +807,7 @@ test "parallel resource read" {
 }
 
 test "parallel prompt render" {
-    if (!build_options.enable_spice) return error.SkipZigTest;
+    // spice always enabled when this module is compiled
 
     var templates: [8]PromptTemplate = undefined;
     var variables: [8]PromptVariables = undefined;
@@ -838,7 +837,7 @@ test "parallel prompt render" {
 }
 
 test "parallel prompt render - empty template" {
-    if (!build_options.enable_spice) return error.SkipZigTest;
+    // spice always enabled when this module is compiled
 
     var templates: [4]PromptTemplate = undefined;
     var variables: [4]PromptVariables = undefined;
@@ -864,7 +863,7 @@ test "parallel prompt render - empty template" {
 }
 
 test "parallel prompt render - variable mismatch" {
-    if (!build_options.enable_spice) return error.SkipZigTest;
+    // spice always enabled when this module is compiled
 
     var templates: [4]PromptTemplate = undefined;
     var variables: [4]PromptVariables = undefined;
