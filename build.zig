@@ -24,12 +24,15 @@ pub fn build(b: *std.Build) void {
     } else null;
 
     // External Dependencies
-    const json_dep = b.dependency("json", .{
-        .target = target,
-        .optimize = optimize,
-        .spice = false,
-    });
-    const json_mod = json_dep.module("json");
+    const use_json = b.option(bool, "json", "Use internal json dependency") orelse true;
+    const json_mod: ?*std.Build.Module = if (use_json) blk: {
+        const json_dep = b.dependency("json", .{
+            .target = target,
+            .optimize = optimize,
+            .spice = false,
+        });
+        break :blk json_dep.module("json");
+    } else null;
 
     // ========================================================================
     // Core Modules
@@ -54,10 +57,8 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/zero_copy.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{
-            .{ .name = "json", .module = json_mod },
-        },
     });
+    if (json_mod) |m| zero_copy_mod.addImport("json", m);
 
     // Pipelining module
     const pipelining_mod = b.addModule("pipelining", .{
@@ -85,10 +86,10 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
-            .{ .name = "json", .module = json_mod },
             .{ .name = "parallel", .module = parallel_mod },
         },
     });
+    if (json_mod) |m| mcp_mod.addImport("json", m);
 
     // Server extensions module
     const server_ext_mod = b.addModule("server_ext", .{
@@ -121,30 +122,28 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(mcp_server);
 
     // MCP Protocol Inspector
+    const mcp_inspect_mod = b.createModule(.{
+        .root_source_file = b.path("cmd/mcp-inspect/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    if (json_mod) |m| mcp_inspect_mod.addImport("json", m);
     const mcp_inspect = b.addExecutable(.{
         .name = "mcp-inspect",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("cmd/mcp-inspect/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "json", .module = json_mod },
-            },
-        }),
+        .root_module = mcp_inspect_mod,
     });
     b.installArtifact(mcp_inspect);
 
     // MCP Test Client
+    const mcp_client_mod = b.createModule(.{
+        .root_source_file = b.path("cmd/mcp-client/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    if (json_mod) |m| mcp_client_mod.addImport("json", m);
     const mcp_client = b.addExecutable(.{
         .name = "mcp-client",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("cmd/mcp-client/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "json", .module = json_mod },
-            },
-        }),
+        .root_module = mcp_client_mod,
     });
     b.installArtifact(mcp_client);
 
@@ -218,15 +217,14 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run all tests");
 
     // Unit tests for main module
+    const unit_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/mcp.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    if (json_mod) |m| unit_test_mod.addImport("json", m);
     const unit_test = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/mcp.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "json", .module = json_mod },
-            },
-        }),
+        .root_module = unit_test_mod,
     });
     const run_unit_test = b.addRunArtifact(unit_test);
     test_step.dependOn(&run_unit_test.step);
@@ -254,15 +252,14 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_tls_test.step);
 
     // Zero-copy module tests
+    const zero_copy_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/zero_copy.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    if (json_mod) |m| zero_copy_test_mod.addImport("json", m);
     const zero_copy_test = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/zero_copy.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "json", .module = json_mod },
-            },
-        }),
+        .root_module = zero_copy_test_mod,
     });
     const run_zero_copy_test = b.addRunArtifact(zero_copy_test);
     test_step.dependOn(&run_zero_copy_test.step);
@@ -294,31 +291,33 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_server_ext_test.step);
 
     // Acceptance tests
+    const accept_test_mod = b.createModule(.{
+        .root_source_file = b.path("tests/accept.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "mcp", .module = mcp_mod },
+        },
+    });
+    if (json_mod) |m| accept_test_mod.addImport("json", m);
     const accept_test = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/accept.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "mcp", .module = mcp_mod },
-                .{ .name = "json", .module = json_mod },
-            },
-        }),
+        .root_module = accept_test_mod,
     });
     const run_accept_test = b.addRunArtifact(accept_test);
     test_step.dependOn(&run_accept_test.step);
 
     // Conformance tests
+    const conformance_test_mod = b.createModule(.{
+        .root_source_file = b.path("tests/conformance.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "mcp", .module = mcp_mod },
+        },
+    });
+    if (json_mod) |m| conformance_test_mod.addImport("json", m);
     const conformance_test = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/conformance.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "mcp", .module = mcp_mod },
-                .{ .name = "json", .module = json_mod },
-            },
-        }),
+        .root_module = conformance_test_mod,
     });
     const run_conformance_test = b.addRunArtifact(conformance_test);
     test_step.dependOn(&run_conformance_test.step);
@@ -334,17 +333,18 @@ pub fn build(b: *std.Build) void {
     // Fuzz Testing
     // ========================================================================
 
+    const fuzz_exe_mod = b.createModule(.{
+        .root_source_file = b.path("tests/fuzz.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "mcp", .module = mcp_mod },
+        },
+    });
+    if (json_mod) |m| fuzz_exe_mod.addImport("json", m);
     const fuzz_exe = b.addExecutable(.{
         .name = "fuzz",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/fuzz.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "mcp", .module = mcp_mod },
-                .{ .name = "json", .module = json_mod },
-            },
-        }),
+        .root_module = fuzz_exe_mod,
     });
     b.installArtifact(fuzz_exe);
 
@@ -359,17 +359,18 @@ pub fn build(b: *std.Build) void {
     // Benchmarks
     // ========================================================================
 
+    const bench_exe_mod = b.createModule(.{
+        .root_source_file = b.path("tests/bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .imports = &.{
+            .{ .name = "mcp", .module = mcp_mod },
+        },
+    });
+    if (json_mod) |m| bench_exe_mod.addImport("json", m);
     const bench_exe = b.addExecutable(.{
         .name = "bench",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/bench.zig"),
-            .target = target,
-            .optimize = .ReleaseFast,
-            .imports = &.{
-                .{ .name = "mcp", .module = mcp_mod },
-                .{ .name = "json", .module = json_mod },
-            },
-        }),
+        .root_module = bench_exe_mod,
     });
     b.installArtifact(bench_exe);
 
@@ -389,7 +390,6 @@ pub fn build(b: *std.Build) void {
 
     // Expose modules for external use
     _ = tls_mod;
-    _ = zero_copy_mod;
     _ = pipelining_mod;
     _ = server_ext_mod;
 }
