@@ -7,16 +7,16 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // Spice parallelism option
-    const enable_spice = b.option(bool, "spice", "Enable spice-based parallelism") orelse true;
+    // Thread-pool parallelism option
+    const enable_tp = b.option(bool, "thread-pool", "Enable thread-pool-based parallelism") orelse true;
 
-    // Get spice dependency if enabled
-    const spice_mod: ?*std.Build.Module = if (enable_spice) blk: {
-        const spice_dep = b.dependency("spice", .{
+    // Get thread_pool dependency if enabled
+    const tp_mod: ?*std.Build.Module = if (enable_tp) blk: {
+        const tp_dep = b.dependency("thread_pool", .{
             .target = target,
             .optimize = optimize,
         });
-        break :blk spice_dep.module("spice");
+        break :blk tp_dep.module("thread_pool");
     } else null;
 
     // External Dependencies
@@ -25,7 +25,6 @@ pub fn build(b: *std.Build) void {
         const json_dep = b.dependency("json", .{
             .target = target,
             .optimize = optimize,
-            .spice = false,
         });
         break :blk json_dep.module("json");
     } else null;
@@ -64,25 +63,24 @@ pub fn build(b: *std.Build) void {
     });
 
     // Parallel module
-    const parallel_mod: ?*std.Build.Module = if (enable_spice) blk: {
+    const parallel_mod: ?*std.Build.Module = if (enable_tp) blk: {
         break :blk b.addModule("parallel", .{
-        .root_source_file = b.path("src/parallel.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-        },
-    });
+            .root_source_file = b.path("src/parallel.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{},
+        });
     } else null;
-    if (parallel_mod) |pm| { if (spice_mod) |sm| pm.addImport("spice", sm); }
+    if (parallel_mod) |pm| {
+        if (tp_mod) |tm| pm.addImport("thread_pool", tm);
+    }
 
     // Main MCP module
     const mcp_mod = b.addModule("mcp", .{
         .root_source_file = b.path("src/mcp.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{
-            
-        },
+        .imports = &.{},
     });
     if (json_mod) |m| mcp_mod.addImport("json", m);
 

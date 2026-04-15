@@ -40,19 +40,19 @@ const DynamicState = struct {
     pub fn init(allocator: std.mem.Allocator) DynamicState {
         return .{
             .allocator = allocator,
-            .tools = std.ArrayList(Tool).init(allocator),
-            .resources = std.ArrayList(Resource).init(allocator),
+            .tools = .{},
+            .resources = .{},
         };
     }
 
     pub fn deinit(self: *DynamicState) void {
-        self.tools.deinit();
-        self.resources.deinit();
+        self.tools.deinit(self.allocator);
+        self.resources.deinit(self.allocator);
     }
 
     /// Add a tool and notify clients
     pub fn addTool(self: *DynamicState, name: []const u8, description: []const u8) !void {
-        try self.tools.append(.{ .name = name, .description = description });
+        try self.tools.append(self.allocator, .{ .name = name, .description = description });
 
         // Notify clients that tool list has changed
         if (self.server) |server| {
@@ -64,7 +64,7 @@ const DynamicState = struct {
 
     /// Add a resource and notify clients
     pub fn addResource(self: *DynamicState, uri: []const u8, name: []const u8) !void {
-        try self.resources.append(.{ .uri = uri, .name = name });
+        try self.resources.append(self.allocator, .{ .uri = uri, .name = name });
 
         // Notify clients that resource list has changed
         if (self.server) |server| {

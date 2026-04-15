@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2024-2025 CodePros
 
-//! Parallel MCP operations using spice heartbeat scheduling.
+//! Parallel MCP operations using thread-pool submit/WaitGroup scheduling.
 //!
 //! Provides high-performance parallel implementations for MCP operations
 //! including JSON-RPC batch processing, SSE broadcasting, tool execution,
@@ -10,13 +10,13 @@
 //! ## Overview
 //!
 //! This module enables parallel processing of Model Context Protocol
-//! operations using the spice thread pool. Ideal for MCP servers handling
+//! operations using the thread-pool library. Ideal for MCP servers handling
 //! multiple clients or batch requests.
 //!
 //! ## Build Configuration
 //!
-//! Enable: `-Dspice=true` (default)
-//! Disable: `-Dspice=false`
+//! Enable: `-Dthread-pool=true` (default)
+//! Disable: `-Dthread-pool=false`
 //!
 //! ## Usage Example
 //!
@@ -49,40 +49,29 @@
 //! | Prompt Render    | 4 templates | Yes              |
 
 const std = @import("std");
-
-const spice = if (true) @import("spice") else struct {
-    pub const ThreadPool = void;
-    pub const Task = void;
-    pub fn Future(comptime I: type, comptime O: type) type {
-        _ = I;
-        _ = O;
-        return void;
-    }
-};
+const tp = @import("thread_pool");
 
 // ============================================================================
 // Global Thread Pool
 // ============================================================================
 
-var global_pool: if (true) ?spice.ThreadPool else void = if (true) null else {};
+const MAX_CHUNKS = 64;
+
+var global_pool: ?tp.ThreadPool = null;
 var pool_mutex: std.Thread.Mutex = .{};
 
-pub fn getPool() if (true) *spice.ThreadPool else void {
-    // spice always enabled when this module is compiled
-
+pub fn getPool() *tp.ThreadPool {
     pool_mutex.lock();
     defer pool_mutex.unlock();
 
     if (global_pool == null) {
-        global_pool = spice.ThreadPool.init(std.heap.page_allocator);
-        global_pool.?.start(.{});
+        global_pool = tp.ThreadPool.init(std.heap.page_allocator, .{}) catch
+            @panic("thread-pool: init failed");
     }
     return &global_pool.?;
 }
 
 pub fn deinitPool() void {
-    // spice always enabled when this module is compiled
-
     pool_mutex.lock();
     defer pool_mutex.unlock();
 
@@ -114,13 +103,20 @@ pub const JsonRpcResponse = struct {
 /// Request handler function type
 pub const RequestHandler = *const fn (request: JsonRpcRequest, allocator: std.mem.Allocator) JsonRpcResponse;
 
-/// Context for parallel batch processing
-pub const BatchProcessContext = struct {
+/// Chunk context for parallel batch processing
+const BatchProcessChunk = struct {
     requests: []const JsonRpcRequest,
     responses: []JsonRpcResponse,
     handler: RequestHandler,
     allocator: std.mem.Allocator,
 };
+
+fn batchProcessChunkTask(ctx_ptr: *anyopaque, _: *tp.TaskContext) void {
+    const chunk: *BatchProcessChunk = @ptrCast(@alignCast(ctx_ptr));
+    for (chunk.requests, 0..) |request, i| {
+        chunk.responses[i] = chunk.handler(request, chunk.allocator);
+    }
+}
 
 /// Process multiple JSON-RPC requests in parallel.
 ///
@@ -142,7 +138,7 @@ pub fn parallelBatchProcess(
 ) void {
     std.debug.assert(requests.len == responses.len);
 
-    if (!true or requests.len < 4) {
+    if (requests.len < 4) {
         for (requests, 0..) |request, i| {
             responses[i] = handler(request, allocator);
         }
@@ -150,47 +146,34 @@ pub fn parallelBatchProcess(
     }
 
     const pool = getPool();
-    const ctx = BatchProcessContext{
-        .requests = requests,
-        .responses = responses,
-        .handler = handler,
-        .allocator = allocator,
-    };
-    _ = pool.call(void, parallelBatchProcessTask, ctx);
-}
+    const chunk_size = @max(1, requests.len / MAX_CHUNKS);
 
-fn parallelBatchProcessTask(t: *spice.Task, ctx: BatchProcessContext) void {
-    const requests = ctx.requests;
-    const responses = ctx.responses;
+    var chunks: [MAX_CHUNKS]BatchProcessChunk = undefined;
+    var batch: [MAX_CHUNKS]tp.BatchTask = undefined;
+    var n: usize = 0;
 
-    if (requests.len < 2) {
-        for (requests, 0..) |request, i| {
-            responses[i] = ctx.handler(request, ctx.allocator);
+    var i: usize = 0;
+    while (i < requests.len and n < MAX_CHUNKS) {
+        const end = @min(i + chunk_size, requests.len);
+        chunks[n] = .{
+            .requests = requests[i..end],
+            .responses = responses[i..end],
+            .handler = handler,
+            .allocator = allocator,
+        };
+        batch[n] = .{ .task_fn = &batchProcessChunkTask, .ctx = @ptrCast(&chunks[n]) };
+        n += 1;
+        i = end;
+    }
+
+    var wg = pool.waitGroup();
+    _ = pool.submitBatch(batch[0..n], .{ .wait_group = &wg }) catch {
+        for (requests, 0..) |request, j| {
+            responses[j] = handler(request, allocator);
         }
         return;
-    }
-
-    const mid = requests.len / 2;
-    const left_ctx = BatchProcessContext{
-        .requests = requests[0..mid],
-        .responses = responses[0..mid],
-        .handler = ctx.handler,
-        .allocator = ctx.allocator,
     };
-    const right_ctx = BatchProcessContext{
-        .requests = requests[mid..],
-        .responses = responses[mid..],
-        .handler = ctx.handler,
-        .allocator = ctx.allocator,
-    };
-
-    var fut = spice.Future(BatchProcessContext, void).init();
-    fut.fork(t, parallelBatchProcessTask, right_ctx);
-
-    t.call(void, parallelBatchProcessTask, left_ctx);
-    if (fut.join(t) == null) {
-        t.call(void, parallelBatchProcessTask, right_ctx);
-    }
+    wg.wait();
 }
 
 // ============================================================================
@@ -221,13 +204,20 @@ pub const SseSendResult = struct {
 /// SSE sender function type
 pub const SseSender = *const fn (client: SseClient, event: SseEvent) SseSendResult;
 
-/// Context for parallel SSE broadcast
-pub const SseBroadcastContext = struct {
+/// Chunk context for parallel SSE broadcast
+const SseBroadcastChunk = struct {
     clients: []const SseClient,
     event: SseEvent,
     results: []SseSendResult,
     sender: SseSender,
 };
+
+fn sseBroadcastChunkTask(ctx_ptr: *anyopaque, _: *tp.TaskContext) void {
+    const chunk: *SseBroadcastChunk = @ptrCast(@alignCast(ctx_ptr));
+    for (chunk.clients, 0..) |client, i| {
+        chunk.results[i] = chunk.sender(client, chunk.event);
+    }
+}
 
 /// Broadcast SSE event to multiple clients in parallel.
 ///
@@ -249,7 +239,7 @@ pub fn parallelSseBroadcast(
 ) void {
     std.debug.assert(clients.len == results.len);
 
-    if (!true or clients.len < 8) {
+    if (clients.len < 8) {
         for (clients, 0..) |client, i| {
             results[i] = sender(client, event);
         }
@@ -257,47 +247,34 @@ pub fn parallelSseBroadcast(
     }
 
     const pool = getPool();
-    const ctx = SseBroadcastContext{
-        .clients = clients,
-        .event = event,
-        .results = results,
-        .sender = sender,
-    };
-    _ = pool.call(void, parallelSseBroadcastTask, ctx);
-}
+    const chunk_size = @max(1, clients.len / MAX_CHUNKS);
 
-fn parallelSseBroadcastTask(t: *spice.Task, ctx: SseBroadcastContext) void {
-    const clients = ctx.clients;
-    const results = ctx.results;
+    var chunks: [MAX_CHUNKS]SseBroadcastChunk = undefined;
+    var batch: [MAX_CHUNKS]tp.BatchTask = undefined;
+    var n: usize = 0;
 
-    if (clients.len < 4) {
-        for (clients, 0..) |client, i| {
-            results[i] = ctx.sender(client, ctx.event);
+    var i: usize = 0;
+    while (i < clients.len and n < MAX_CHUNKS) {
+        const end = @min(i + chunk_size, clients.len);
+        chunks[n] = .{
+            .clients = clients[i..end],
+            .event = event,
+            .results = results[i..end],
+            .sender = sender,
+        };
+        batch[n] = .{ .task_fn = &sseBroadcastChunkTask, .ctx = @ptrCast(&chunks[n]) };
+        n += 1;
+        i = end;
+    }
+
+    var wg = pool.waitGroup();
+    _ = pool.submitBatch(batch[0..n], .{ .wait_group = &wg }) catch {
+        for (clients, 0..) |client, j| {
+            results[j] = sender(client, event);
         }
         return;
-    }
-
-    const mid = clients.len / 2;
-    const left_ctx = SseBroadcastContext{
-        .clients = clients[0..mid],
-        .event = ctx.event,
-        .results = results[0..mid],
-        .sender = ctx.sender,
     };
-    const right_ctx = SseBroadcastContext{
-        .clients = clients[mid..],
-        .event = ctx.event,
-        .results = results[mid..],
-        .sender = ctx.sender,
-    };
-
-    var fut = spice.Future(SseBroadcastContext, void).init();
-    fut.fork(t, parallelSseBroadcastTask, right_ctx);
-
-    t.call(void, parallelSseBroadcastTask, left_ctx);
-    if (fut.join(t) == null) {
-        t.call(void, parallelSseBroadcastTask, right_ctx);
-    }
+    wg.wait();
 }
 
 // ============================================================================
@@ -322,13 +299,20 @@ pub const ToolResult = struct {
 /// Tool executor function type
 pub const ToolExecutor = *const fn (call: ToolCall, allocator: std.mem.Allocator) ToolResult;
 
-/// Context for parallel tool execution
-pub const ToolExecuteContext = struct {
+/// Chunk context for parallel tool execution
+const ToolExecuteChunk = struct {
     calls: []const ToolCall,
     results: []ToolResult,
     executor: ToolExecutor,
     allocator: std.mem.Allocator,
 };
+
+fn toolExecuteChunkTask(ctx_ptr: *anyopaque, _: *tp.TaskContext) void {
+    const chunk: *ToolExecuteChunk = @ptrCast(@alignCast(ctx_ptr));
+    for (chunk.calls, 0..) |call, i| {
+        chunk.results[i] = chunk.executor(call, chunk.allocator);
+    }
+}
 
 /// Execute multiple tool calls in parallel.
 ///
@@ -350,7 +334,7 @@ pub fn parallelToolExecute(
 ) void {
     std.debug.assert(calls.len == results.len);
 
-    if (!true or calls.len < 2) {
+    if (calls.len < 2) {
         for (calls, 0..) |call, i| {
             results[i] = executor(call, allocator);
         }
@@ -358,47 +342,34 @@ pub fn parallelToolExecute(
     }
 
     const pool = getPool();
-    const ctx = ToolExecuteContext{
-        .calls = calls,
-        .results = results,
-        .executor = executor,
-        .allocator = allocator,
-    };
-    _ = pool.call(void, parallelToolExecuteTask, ctx);
-}
+    const chunk_size = @max(1, calls.len / MAX_CHUNKS);
 
-fn parallelToolExecuteTask(t: *spice.Task, ctx: ToolExecuteContext) void {
-    const calls = ctx.calls;
-    const results = ctx.results;
+    var chunks: [MAX_CHUNKS]ToolExecuteChunk = undefined;
+    var batch: [MAX_CHUNKS]tp.BatchTask = undefined;
+    var n: usize = 0;
 
-    if (calls.len < 2) {
-        for (calls, 0..) |call, i| {
-            results[i] = ctx.executor(call, ctx.allocator);
+    var i: usize = 0;
+    while (i < calls.len and n < MAX_CHUNKS) {
+        const end = @min(i + chunk_size, calls.len);
+        chunks[n] = .{
+            .calls = calls[i..end],
+            .results = results[i..end],
+            .executor = executor,
+            .allocator = allocator,
+        };
+        batch[n] = .{ .task_fn = &toolExecuteChunkTask, .ctx = @ptrCast(&chunks[n]) };
+        n += 1;
+        i = end;
+    }
+
+    var wg = pool.waitGroup();
+    _ = pool.submitBatch(batch[0..n], .{ .wait_group = &wg }) catch {
+        for (calls, 0..) |call, j| {
+            results[j] = executor(call, allocator);
         }
         return;
-    }
-
-    const mid = calls.len / 2;
-    const left_ctx = ToolExecuteContext{
-        .calls = calls[0..mid],
-        .results = results[0..mid],
-        .executor = ctx.executor,
-        .allocator = ctx.allocator,
     };
-    const right_ctx = ToolExecuteContext{
-        .calls = calls[mid..],
-        .results = results[mid..],
-        .executor = ctx.executor,
-        .allocator = ctx.allocator,
-    };
-
-    var fut = spice.Future(ToolExecuteContext, void).init();
-    fut.fork(t, parallelToolExecuteTask, right_ctx);
-
-    t.call(void, parallelToolExecuteTask, left_ctx);
-    if (fut.join(t) == null) {
-        t.call(void, parallelToolExecuteTask, right_ctx);
-    }
+    wg.wait();
 }
 
 // ============================================================================
@@ -423,13 +394,20 @@ pub const ResourceReadResult = struct {
 /// Resource reader function type
 pub const ResourceReader = *const fn (request: ResourceReadRequest, allocator: std.mem.Allocator) ResourceReadResult;
 
-/// Context for parallel resource reading
-pub const ResourceReadContext = struct {
+/// Chunk context for parallel resource reading
+const ResourceReadChunk = struct {
     requests: []const ResourceReadRequest,
     results: []ResourceReadResult,
     reader: ResourceReader,
     allocator: std.mem.Allocator,
 };
+
+fn resourceReadChunkTask(ctx_ptr: *anyopaque, _: *tp.TaskContext) void {
+    const chunk: *ResourceReadChunk = @ptrCast(@alignCast(ctx_ptr));
+    for (chunk.requests, 0..) |request, i| {
+        chunk.results[i] = chunk.reader(request, chunk.allocator);
+    }
+}
 
 /// Read multiple resources in parallel.
 ///
@@ -451,7 +429,7 @@ pub fn parallelResourceRead(
 ) void {
     std.debug.assert(requests.len == results.len);
 
-    if (!true or requests.len < 2) {
+    if (requests.len < 2) {
         for (requests, 0..) |request, i| {
             results[i] = reader(request, allocator);
         }
@@ -459,47 +437,34 @@ pub fn parallelResourceRead(
     }
 
     const pool = getPool();
-    const ctx = ResourceReadContext{
-        .requests = requests,
-        .results = results,
-        .reader = reader,
-        .allocator = allocator,
-    };
-    _ = pool.call(void, parallelResourceReadTask, ctx);
-}
+    const chunk_size = @max(1, requests.len / MAX_CHUNKS);
 
-fn parallelResourceReadTask(t: *spice.Task, ctx: ResourceReadContext) void {
-    const requests = ctx.requests;
-    const results = ctx.results;
+    var chunks: [MAX_CHUNKS]ResourceReadChunk = undefined;
+    var batch: [MAX_CHUNKS]tp.BatchTask = undefined;
+    var n: usize = 0;
 
-    if (requests.len < 2) {
-        for (requests, 0..) |request, i| {
-            results[i] = ctx.reader(request, ctx.allocator);
+    var i: usize = 0;
+    while (i < requests.len and n < MAX_CHUNKS) {
+        const end = @min(i + chunk_size, requests.len);
+        chunks[n] = .{
+            .requests = requests[i..end],
+            .results = results[i..end],
+            .reader = reader,
+            .allocator = allocator,
+        };
+        batch[n] = .{ .task_fn = &resourceReadChunkTask, .ctx = @ptrCast(&chunks[n]) };
+        n += 1;
+        i = end;
+    }
+
+    var wg = pool.waitGroup();
+    _ = pool.submitBatch(batch[0..n], .{ .wait_group = &wg }) catch {
+        for (requests, 0..) |request, j| {
+            results[j] = reader(request, allocator);
         }
         return;
-    }
-
-    const mid = requests.len / 2;
-    const left_ctx = ResourceReadContext{
-        .requests = requests[0..mid],
-        .results = results[0..mid],
-        .reader = ctx.reader,
-        .allocator = ctx.allocator,
     };
-    const right_ctx = ResourceReadContext{
-        .requests = requests[mid..],
-        .results = results[mid..],
-        .reader = ctx.reader,
-        .allocator = ctx.allocator,
-    };
-
-    var fut = spice.Future(ResourceReadContext, void).init();
-    fut.fork(t, parallelResourceReadTask, right_ctx);
-
-    t.call(void, parallelResourceReadTask, left_ctx);
-    if (fut.join(t) == null) {
-        t.call(void, parallelResourceReadTask, right_ctx);
-    }
+    wg.wait();
 }
 
 // ============================================================================
@@ -525,13 +490,20 @@ pub const PromptRenderResult = struct {
     error_msg: ?[]const u8,
 };
 
-/// Context for parallel prompt rendering
-pub const PromptRenderContext = struct {
+/// Chunk context for parallel prompt rendering
+const PromptRenderChunk = struct {
     templates: []const PromptTemplate,
     variables: []const PromptVariables,
     results: []PromptRenderResult,
     allocator: std.mem.Allocator,
 };
+
+fn promptRenderChunkTask(ctx_ptr: *anyopaque, _: *tp.TaskContext) void {
+    const chunk: *PromptRenderChunk = @ptrCast(@alignCast(ctx_ptr));
+    for (chunk.templates, 0..) |template, i| {
+        chunk.results[i] = renderPrompt(chunk.allocator, template, chunk.variables[i]);
+    }
+}
 
 /// Render multiple prompt templates in parallel.
 ///
@@ -554,7 +526,7 @@ pub fn parallelPromptRender(
     std.debug.assert(templates.len == variables.len);
     std.debug.assert(templates.len == results.len);
 
-    if (!true or templates.len < 4) {
+    if (templates.len < 4) {
         for (templates, 0..) |template, i| {
             results[i] = renderPrompt(allocator, template, variables[i]);
         }
@@ -562,48 +534,34 @@ pub fn parallelPromptRender(
     }
 
     const pool = getPool();
-    const ctx = PromptRenderContext{
-        .templates = templates,
-        .variables = variables,
-        .results = results,
-        .allocator = allocator,
-    };
-    _ = pool.call(void, parallelPromptRenderTask, ctx);
-}
+    const chunk_size = @max(1, templates.len / MAX_CHUNKS);
 
-fn parallelPromptRenderTask(t: *spice.Task, ctx: PromptRenderContext) void {
-    const templates = ctx.templates;
-    const variables = ctx.variables;
-    const results = ctx.results;
+    var chunks: [MAX_CHUNKS]PromptRenderChunk = undefined;
+    var batch: [MAX_CHUNKS]tp.BatchTask = undefined;
+    var n: usize = 0;
 
-    if (templates.len < 2) {
-        for (templates, 0..) |template, i| {
-            results[i] = renderPrompt(ctx.allocator, template, variables[i]);
+    var i: usize = 0;
+    while (i < templates.len and n < MAX_CHUNKS) {
+        const end = @min(i + chunk_size, templates.len);
+        chunks[n] = .{
+            .templates = templates[i..end],
+            .variables = variables[i..end],
+            .results = results[i..end],
+            .allocator = allocator,
+        };
+        batch[n] = .{ .task_fn = &promptRenderChunkTask, .ctx = @ptrCast(&chunks[n]) };
+        n += 1;
+        i = end;
+    }
+
+    var wg = pool.waitGroup();
+    _ = pool.submitBatch(batch[0..n], .{ .wait_group = &wg }) catch {
+        for (templates, 0..) |template, j| {
+            results[j] = renderPrompt(allocator, template, variables[j]);
         }
         return;
-    }
-
-    const mid = templates.len / 2;
-    const left_ctx = PromptRenderContext{
-        .templates = templates[0..mid],
-        .variables = variables[0..mid],
-        .results = results[0..mid],
-        .allocator = ctx.allocator,
     };
-    const right_ctx = PromptRenderContext{
-        .templates = templates[mid..],
-        .variables = variables[mid..],
-        .results = results[mid..],
-        .allocator = ctx.allocator,
-    };
-
-    var fut = spice.Future(PromptRenderContext, void).init();
-    fut.fork(t, parallelPromptRenderTask, right_ctx);
-
-    t.call(void, parallelPromptRenderTask, left_ctx);
-    if (fut.join(t) == null) {
-        t.call(void, parallelPromptRenderTask, right_ctx);
-    }
+    wg.wait();
 }
 
 fn renderPrompt(allocator: std.mem.Allocator, template: PromptTemplate, vars: PromptVariables) PromptRenderResult {
@@ -616,7 +574,7 @@ fn renderPrompt(allocator: std.mem.Allocator, template: PromptTemplate, vars: Pr
     }
 
     // Simple variable substitution (actual implementation would be more sophisticated)
-    var result = allocator.dupe(u8, template.template) catch {
+    const result = allocator.dupe(u8, template.template) catch {
         return .{ .success = false, .rendered = null, .error_msg = "alloc failed" };
     };
 
@@ -639,13 +597,10 @@ fn testHandler(request: JsonRpcRequest, allocator: std.mem.Allocator) JsonRpcRes
 }
 
 test "parallel batch process" {
-    // spice always enabled when this module is compiled
-
     var requests: [8]JsonRpcRequest = undefined;
     var responses: [8]JsonRpcResponse = undefined;
 
-    for (&requests, 0..) |*request, i| {
-        _ = i;
+    for (&requests) |*request| {
         request.* = .{
             .id = "test-id",
             .method = "test/method",
@@ -670,8 +625,6 @@ fn testSender(client: SseClient, event: SseEvent) SseSendResult {
 }
 
 test "parallel sse broadcast" {
-    // spice always enabled when this module is compiled
-
     var clients: [16]SseClient = undefined;
     var results: [16]SseSendResult = undefined;
 
@@ -697,8 +650,6 @@ test "parallel sse broadcast" {
 }
 
 test "parallel sse broadcast - inactive clients" {
-    // spice always enabled when this module is compiled
-
     var clients: [8]SseClient = undefined;
     var results: [8]SseSendResult = undefined;
 
@@ -734,8 +685,6 @@ fn testExecutor(call: ToolCall, allocator: std.mem.Allocator) ToolResult {
 }
 
 test "parallel tool execute" {
-    // spice always enabled when this module is compiled
-
     var calls: [4]ToolCall = undefined;
     var results: [4]ToolResult = undefined;
 
@@ -755,8 +704,6 @@ test "parallel tool execute" {
 }
 
 test "parallel tool execute - empty name" {
-    // spice always enabled when this module is compiled
-
     var calls: [4]ToolCall = undefined;
     var results: [4]ToolResult = undefined;
 
@@ -787,8 +734,6 @@ fn testReader(request: ResourceReadRequest, allocator: std.mem.Allocator) Resour
 }
 
 test "parallel resource read" {
-    // spice always enabled when this module is compiled
-
     var requests: [4]ResourceReadRequest = undefined;
     var results: [4]ResourceReadResult = undefined;
 
@@ -807,14 +752,11 @@ test "parallel resource read" {
 }
 
 test "parallel prompt render" {
-    // spice always enabled when this module is compiled
-
     var templates: [8]PromptTemplate = undefined;
     var variables: [8]PromptVariables = undefined;
     var results: [8]PromptRenderResult = undefined;
 
-    for (&templates, 0..) |*tmpl, i| {
-        _ = i;
+    for (&templates) |*tmpl| {
         tmpl.* = .{
             .name = "greeting",
             .template = "Hello, {{name}}!",
@@ -837,8 +779,6 @@ test "parallel prompt render" {
 }
 
 test "parallel prompt render - empty template" {
-    // spice always enabled when this module is compiled
-
     var templates: [4]PromptTemplate = undefined;
     var variables: [4]PromptVariables = undefined;
     var results: [4]PromptRenderResult = undefined;
@@ -863,8 +803,6 @@ test "parallel prompt render - empty template" {
 }
 
 test "parallel prompt render - variable mismatch" {
-    // spice always enabled when this module is compiled
-
     var templates: [4]PromptTemplate = undefined;
     var variables: [4]PromptVariables = undefined;
     var results: [4]PromptRenderResult = undefined;

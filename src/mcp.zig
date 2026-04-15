@@ -3492,24 +3492,24 @@ pub const DemoHandler = struct {
     }
 
     fn listTools(_: ?*anyopaque, _: ?[]const u8) anyerror![]const u8 {
-        return
+        const result: []const u8 =
             \\{"tools":[{"name":"barrier","description":"Barrier for testing parallelism","inputSchema":{"type":"object","properties":{"count":{"type":"integer"}}}}]}
         ;
+        return result;
     }
 
     fn callTool(_: ?*anyopaque, name: []const u8, _: []const u8, _: *const CancelToken) anyerror![]const u8 {
         if (std.mem.eql(u8, name, "barrier")) {
-            return
+            const result: []const u8 =
                 \\{"content":[{"type":"text","text":"barrier passed"}]}
             ;
+            return result;
         }
         return error.ToolNotFound;
     }
 
     fn listResources(_: ?*anyopaque, _: ?[]const u8) anyerror![]const u8 {
-        return
-            \\{"resources":[]}
-        ;
+        return "{\"resources\":[]}";
     }
 
     fn readResource(_: ?*anyopaque, _: []const u8) anyerror![]const u8 {
@@ -3517,9 +3517,7 @@ pub const DemoHandler = struct {
     }
 
     fn listResourceTemplates(_: ?*anyopaque) anyerror![]const u8 {
-        return
-            \\{"resourceTemplates":[]}
-        ;
+        return "{\"resourceTemplates\":[]}";
     }
 
     fn subscribeResource(_: ?*anyopaque, _: []const u8) anyerror!void {}
@@ -3527,9 +3525,7 @@ pub const DemoHandler = struct {
     fn unsubscribeResource(_: ?*anyopaque, _: []const u8) anyerror!void {}
 
     fn listPrompts(_: ?*anyopaque, _: ?[]const u8) anyerror![]const u8 {
-        return
-            \\{"prompts":[]}
-        ;
+        return "{\"prompts\":[]}";
     }
 
     fn getPrompt(_: ?*anyopaque, _: []const u8, _: ?[]const u8) anyerror![]const u8 {
@@ -3537,9 +3533,7 @@ pub const DemoHandler = struct {
     }
 
     fn complete(_: ?*anyopaque, _: []const u8) anyerror![]const u8 {
-        return
-            \\{"completion":{"values":[]}}
-        ;
+        return "{\"completion\":{\"values\":[]}}";
     }
 
     fn setLogLevel(_: ?*anyopaque, _: []const u8) anyerror!void {}
