@@ -16,6 +16,7 @@
 
 const std = @import("std");
 const json = @import("json");
+const tp = @import("thread_pool");
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 
@@ -1418,6 +1419,10 @@ pub const Server = struct {
     work_queue: std.ArrayListUnmanaged(WorkItem) = .empty,
     shutdown: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
+    /// Shared thread-pool for batch work. Initialized by startWorkers (Task 3
+    /// will replace the bespoke `workers: []std.Thread` field entirely).
+    pool: ?*tp.ThreadPool = null,
+
     // Stdio (with buffered I/O - Zig 0.15 API)
     stdin_file: ?std.Io.File = null,
     stdout_file: ?std.Io.File = null,
@@ -2681,15 +2686,52 @@ pub const Server = struct {
             r.* = .{ .response = null, .index = 0 };
         }
 
-        // Process in parallel if worker_threads > 0, otherwise sequential
-        if (self.options.worker_threads > 0 and items.len > 1) {
-            // Spawn threads for parallel processing
+        // Process in parallel via thread-pool if one is attached, otherwise sequential
+        if (self.pool) |pool| if (self.options.worker_threads > 0 and items.len > 1) {
+            var wg = pool.waitGroup();
+
+            const ItemCtx = struct {
+                server: *Server,
+                item: json.Value,
+                index: usize,
+                results: []BatchItemResult,
+                wg: *tp.WaitGroup,
+
+                fn run(ctx_: *anyopaque, _: *tp.TaskContext) void {
+                    const c: *@This() = @ptrCast(@alignCast(ctx_));
+                    const response = c.server.processJsonValue(c.item) catch null;
+                    c.results[c.index] = .{ .response = response, .index = c.index };
+                    c.wg.done();
+                }
+            };
+
+            const ctxs = try self.allocator.alloc(ItemCtx, items.len);
+            defer self.allocator.free(ctxs);
+            const tasks = try self.allocator.alloc(tp.BatchTask, items.len);
+            defer self.allocator.free(tasks);
+
+            for (items, 0..) |item, i| {
+                ctxs[i] = .{ .server = self, .item = item, .index = i, .results = results, .wg = &wg };
+                tasks[i] = .{ .task_fn = ItemCtx.run, .ctx = &ctxs[i] };
+                wg.add(1);
+            }
+
+            _ = try pool.submitBatch(tasks, .{});
+            wg.wait();
+        } else {
+            // Sequential processing (single item or explicitly disabled)
+            for (items, 0..) |item, i| {
+                const response = try self.processJsonValue(item);
+                results[i] = .{ .response = response, .index = i };
+            }
+        } else if (self.options.worker_threads > 0 and items.len > 1) {
+            // Fallback: no pool attached (e.g. Task 3 hasn't landed yet or test harness
+            // didn't inject one) — use the original std.Thread.spawn path.
             const threads = try self.allocator.alloc(std.Thread, items.len);
             defer self.allocator.free(threads);
 
             for (items, 0..) |item, i| {
                 threads[i] = std.Thread.spawn(.{}, batchItemWorker, .{ self, item, i, results }) catch {
-                    // If spawn fails, process sequentially from here
                     for (items[i..], i..) |remaining_item, j| {
                         const response = self.processJsonValue(remaining_item) catch null;
                         results[j] = .{ .response = response, .index = j };
@@ -2698,12 +2740,10 @@ pub const Server = struct {
                 };
             }
 
-            // Wait for all threads
             for (threads) |t| {
                 t.join();
             }
         } else {
-            // Sequential processing
             for (items, 0..) |item, i| {
                 const response = try self.processJsonValue(item);
                 results[i] = .{ .response = response, .index = i };

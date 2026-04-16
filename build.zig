@@ -83,6 +83,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{},
     });
     if (json_mod) |m| mcp_mod.addImport("json", m);
+    if (tp_mod) |tm| mcp_mod.addImport("thread_pool", tm);
 
     // Server extensions module
     const server_ext_mod = b.addModule("server_ext", .{
@@ -216,6 +217,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     if (json_mod) |m| unit_test_mod.addImport("json", m);
+    if (tp_mod) |tm| unit_test_mod.addImport("thread_pool", tm);
     const unit_test = b.addTest(.{
         .root_module = unit_test_mod,
     });
@@ -293,6 +295,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     if (json_mod) |m| accept_test_mod.addImport("json", m);
+    if (tp_mod) |tm| accept_test_mod.addImport("thread_pool", tm);
     const accept_test = b.addTest(.{
         .root_module = accept_test_mod,
     });

@@ -1132,3 +1132,49 @@ test "Parse elicitation capability" {
     try std.testing.expect(response != null);
     try std.testing.expect(server.client_capabilities.elicitation);
 }
+
+test "batch processing dispatches via thread-pool when pool is set" {
+    const allocator = std.testing.allocator;
+
+    // Initialize a thread-pool and inject it into the server.
+    const tp = @import("thread_pool");
+    var pool = try tp.ThreadPool.init(allocator, .{ .max_threads = 4 });
+    defer pool.deinit();
+
+    var server = try mcp.Server.init(allocator, .{
+        .name = "test-server",
+        .version = "1.0.0",
+        .worker_threads = 4,
+    }, mcp.DemoHandler.create());
+    defer server.deinit();
+    server.pool = &pool;
+
+    // Required protocol handshake first.
+    const init_request =
+        \\{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}
+    ;
+    if (try server.processMessage(init_request)) |r| allocator.free(r);
+    _ = try server.processMessage(
+        \\{"jsonrpc":"2.0","method":"notifications/initialized"}
+    );
+
+    // Build a batch of 8 ping requests (each a notification so no response, but each is a dispatch unit).
+    const batch =
+        \\[
+        \\ {"jsonrpc":"2.0","id":1,"method":"ping"},
+        \\ {"jsonrpc":"2.0","id":2,"method":"ping"},
+        \\ {"jsonrpc":"2.0","id":3,"method":"ping"},
+        \\ {"jsonrpc":"2.0","id":4,"method":"ping"},
+        \\ {"jsonrpc":"2.0","id":5,"method":"ping"},
+        \\ {"jsonrpc":"2.0","id":6,"method":"ping"},
+        \\ {"jsonrpc":"2.0","id":7,"method":"ping"},
+        \\ {"jsonrpc":"2.0","id":8,"method":"ping"}
+        \\]
+    ;
+
+    const before = pool.statsSnapshot().submitted;
+    if (try server.processMessage(batch)) |resp| allocator.free(resp);
+    const after = pool.statsSnapshot().submitted;
+
+    try std.testing.expect(after - before >= 8);
+}
