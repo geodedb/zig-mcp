@@ -206,6 +206,8 @@ pub const ExtendedServer = struct {
         }
 
         // Start accept thread
+        // daemon: WebSocket accept loop. Same rationale as the HTTP accept
+        // loop in mcp.zig — long-lived blocking accept.
         self.ws_thread = try std.Thread.spawn(.{}, wsAcceptLoop, .{ self, config });
 
         return actual_port;
@@ -226,6 +228,10 @@ pub const ExtendedServer = struct {
             self.ws_mutex.unlock(io());
 
             // Spawn handler thread
+            // daemon per WebSocket connection: the handler serves messages on the
+            // stream for the connection's lifetime. Long-lived per-client streams
+            // are not a pool fit (see grpc-zig/src/server.zig for parallel
+            // reasoning).
             _ = std.Thread.spawn(.{}, wsConnectionHandler, .{ self, conn, config }) catch {
                 streamClose(conn);
                 continue;

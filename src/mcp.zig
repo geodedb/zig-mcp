@@ -1632,6 +1632,9 @@ pub const Server = struct {
         const actual_port = self.http_listener.?.socket.address.getPort();
 
         self.state = .running;
+        // daemon: HTTP accept loop — runs for the server's lifetime blocking
+        // on listener.accept. Not pool work — a pool worker holding an accept
+        // loop starves the pool, and accept cannot be cooperatively yielded.
         self.http_thread = try std.Thread.spawn(.{}, httpServerThread, .{self});
 
         return actual_port;
