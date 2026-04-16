@@ -117,7 +117,7 @@ const McpClient = struct {
 
     /// Build a batch request
     pub fn buildBatchRequest(self: *McpClient, requests: []const []const u8) ![]u8 {
-        var buf = std.ArrayListUnmanaged(u8){};
+        var buf = std.ArrayListUnmanaged(u8).empty;
         errdefer buf.deinit(self.allocator);
 
         try buf.append(self.allocator, '[');
@@ -134,7 +134,7 @@ const McpClient = struct {
 };
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 

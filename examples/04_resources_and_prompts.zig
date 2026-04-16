@@ -13,7 +13,7 @@ const std = @import("std");
 const mcp = @import("mcp");
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -79,26 +79,26 @@ fn listResources(_: ?*anyopaque, cursor: ?[]const u8) anyerror![]const u8 {
     // - description: Optional description
     // - mimeType: Content type of the resource
     return
-        \\{"resources":[
-        \\  {
-        \\    "uri": "config://app/settings",
-        \\    "name": "Application Settings",
-        \\    "description": "Current application configuration",
-        \\    "mimeType": "application/json"
-        \\  },
-        \\  {
-        \\    "uri": "config://app/version",
-        \\    "name": "Version Info",
-        \\    "description": "Application version information",
-        \\    "mimeType": "application/json"
-        \\  },
-        \\  {
-        \\    "uri": "data://readme",
-        \\    "name": "README",
-        \\    "description": "Server documentation",
-        \\    "mimeType": "text/markdown"
-        \\  }
-        \\]}
+    \\{"resources":[
+    \\  {
+    \\    "uri": "config://app/settings",
+    \\    "name": "Application Settings",
+    \\    "description": "Current application configuration",
+    \\    "mimeType": "application/json"
+    \\  },
+    \\  {
+    \\    "uri": "config://app/version",
+    \\    "name": "Version Info",
+    \\    "description": "Application version information",
+    \\    "mimeType": "application/json"
+    \\  },
+    \\  {
+    \\    "uri": "data://readme",
+    \\    "name": "README",
+    \\    "description": "Server documentation",
+    \\    "mimeType": "text/markdown"
+    \\  }
+    \\]}
     ;
 }
 
@@ -109,31 +109,31 @@ fn readResource(_: ?*anyopaque, uri: []const u8) anyerror![]const u8 {
         // Return resource content
         // The response contains a "contents" array with the resource data
         return
-            \\{"contents":[{
-            \\  "uri": "config://app/settings",
-            \\  "mimeType": "application/json",
-            \\  "text": "{\"theme\":\"dark\",\"language\":\"en\",\"notifications\":true}"
-            \\}]}
+        \\{"contents":[{
+        \\  "uri": "config://app/settings",
+        \\  "mimeType": "application/json",
+        \\  "text": "{\"theme\":\"dark\",\"language\":\"en\",\"notifications\":true}"
+        \\}]}
         ;
     }
 
     if (std.mem.eql(u8, uri, "config://app/version")) {
         return
-            \\{"contents":[{
-            \\  "uri": "config://app/version",
-            \\  "mimeType": "application/json",
-            \\  "text": "{\"version\":\"1.0.0\",\"build\":\"2025.01.24\",\"commit\":\"abc123\"}"
-            \\}]}
+        \\{"contents":[{
+        \\  "uri": "config://app/version",
+        \\  "mimeType": "application/json",
+        \\  "text": "{\"version\":\"1.0.0\",\"build\":\"2025.01.24\",\"commit\":\"abc123\"}"
+        \\}]}
         ;
     }
 
     if (std.mem.eql(u8, uri, "data://readme")) {
         return
-            \\{"contents":[{
-            \\  "uri": "data://readme",
-            \\  "mimeType": "text/markdown",
-            \\  "text": "# MCP Resources Example\n\nThis server demonstrates resource handling in MCP.\n\n## Available Resources\n\n- config://app/settings\n- config://app/version\n- data://readme"
-            \\}]}
+        \\{"contents":[{
+        \\  "uri": "data://readme",
+        \\  "mimeType": "text/markdown",
+        \\  "text": "# MCP Resources Example\n\nThis server demonstrates resource handling in MCP.\n\n## Available Resources\n\n- config://app/settings\n- config://app/version\n- data://readme"
+        \\}]}
         ;
     }
 
@@ -144,11 +144,11 @@ fn readResource(_: ?*anyopaque, uri: []const u8) anyerror![]const u8 {
 
         // In a real implementation, you would look up the user
         return
-            \\{"contents":[{
-            \\  "uri": "data://users/123",
-            \\  "mimeType": "application/json",
-            \\  "text": "{\"id\":123,\"name\":\"Example User\",\"email\":\"user@example.com\"}"
-            \\}]}
+        \\{"contents":[{
+        \\  "uri": "data://users/123",
+        \\  "mimeType": "application/json",
+        \\  "text": "{\"id\":123,\"name\":\"Example User\",\"email\":\"user@example.com\"}"
+        \\}]}
         ;
     }
 
@@ -160,20 +160,20 @@ fn listResourceTemplates(_: ?*anyopaque) anyerror![]const u8 {
     // Resource templates define patterns for dynamic resources
     // The {id} placeholder in the URI is filled in by the client
     return
-        \\{"resourceTemplates":[
-        \\  {
-        \\    "uriTemplate": "data://users/{id}",
-        \\    "name": "User Data",
-        \\    "description": "Retrieve user information by ID",
-        \\    "mimeType": "application/json"
-        \\  },
-        \\  {
-        \\    "uriTemplate": "data://files/{path}",
-        \\    "name": "File Contents",
-        \\    "description": "Read file contents by path",
-        \\    "mimeType": "application/octet-stream"
-        \\  }
-        \\]}
+    \\{"resourceTemplates":[
+    \\  {
+    \\    "uriTemplate": "data://users/{id}",
+    \\    "name": "User Data",
+    \\    "description": "Retrieve user information by ID",
+    \\    "mimeType": "application/json"
+    \\  },
+    \\  {
+    \\    "uriTemplate": "data://files/{path}",
+    \\    "name": "File Contents",
+    \\    "description": "Read file contents by path",
+    \\    "mimeType": "application/octet-stream"
+    \\  }
+    \\]}
     ;
 }
 
@@ -202,69 +202,69 @@ fn listPrompts(_: ?*anyopaque, cursor: ?[]const u8) anyerror![]const u8 {
     // Prompts are reusable templates that clients can invoke
     // Arguments allow customization of the prompt
     return
-        \\{"prompts":[
-        \\  {
-        \\    "name": "summarize",
-        \\    "title": "Text Summarizer",
-        \\    "description": "Summarize text content with customizable style and length",
-        \\    "arguments": [
-        \\      {
-        \\        "name": "text",
-        \\        "description": "The text to summarize",
-        \\        "required": true
-        \\      },
-        \\      {
-        \\        "name": "style",
-        \\        "description": "Summary style: brief, detailed, or bullet-points",
-        \\        "required": false
-        \\      },
-        \\      {
-        \\        "name": "maxLength",
-        \\        "description": "Maximum length in words",
-        \\        "required": false
-        \\      }
-        \\    ]
-        \\  },
-        \\  {
-        \\    "name": "code-review",
-        \\    "title": "Code Reviewer",
-        \\    "description": "Review code for issues, style, and improvements",
-        \\    "arguments": [
-        \\      {
-        \\        "name": "code",
-        \\        "description": "The code to review",
-        \\        "required": true
-        \\      },
-        \\      {
-        \\        "name": "language",
-        \\        "description": "Programming language of the code",
-        \\        "required": true
-        \\      },
-        \\      {
-        \\        "name": "focus",
-        \\        "description": "Focus area: security, performance, style, all",
-        \\        "required": false
-        \\      }
-        \\    ]
-        \\  },
-        \\  {
-        \\    "name": "explain",
-        \\    "title": "Concept Explainer",
-        \\    "description": "Explain a concept at a specified level",
-        \\    "arguments": [
-        \\      {
-        \\        "name": "topic",
-        \\        "description": "The topic or concept to explain",
-        \\        "required": true
-        \\      },
-        \\      {
-        \\        "name": "level",
-        \\        "description": "Explanation level: beginner, intermediate, expert",
-        \\        "required": false
-        \\      }
-        \\    ]
-        \\  }
-        \\]}
+    \\{"prompts":[
+    \\  {
+    \\    "name": "summarize",
+    \\    "title": "Text Summarizer",
+    \\    "description": "Summarize text content with customizable style and length",
+    \\    "arguments": [
+    \\      {
+    \\        "name": "text",
+    \\        "description": "The text to summarize",
+    \\        "required": true
+    \\      },
+    \\      {
+    \\        "name": "style",
+    \\        "description": "Summary style: brief, detailed, or bullet-points",
+    \\        "required": false
+    \\      },
+    \\      {
+    \\        "name": "maxLength",
+    \\        "description": "Maximum length in words",
+    \\        "required": false
+    \\      }
+    \\    ]
+    \\  },
+    \\  {
+    \\    "name": "code-review",
+    \\    "title": "Code Reviewer",
+    \\    "description": "Review code for issues, style, and improvements",
+    \\    "arguments": [
+    \\      {
+    \\        "name": "code",
+    \\        "description": "The code to review",
+    \\        "required": true
+    \\      },
+    \\      {
+    \\        "name": "language",
+    \\        "description": "Programming language of the code",
+    \\        "required": true
+    \\      },
+    \\      {
+    \\        "name": "focus",
+    \\        "description": "Focus area: security, performance, style, all",
+    \\        "required": false
+    \\      }
+    \\    ]
+    \\  },
+    \\  {
+    \\    "name": "explain",
+    \\    "title": "Concept Explainer",
+    \\    "description": "Explain a concept at a specified level",
+    \\    "arguments": [
+    \\      {
+    \\        "name": "topic",
+    \\        "description": "The topic or concept to explain",
+    \\        "required": true
+    \\      },
+    \\      {
+    \\        "name": "level",
+    \\        "description": "Explanation level: beginner, intermediate, expert",
+    \\        "required": false
+    \\      }
+    \\    ]
+    \\  }
+    \\]}
     ;
 }
 
@@ -277,43 +277,43 @@ fn getPrompt(_: ?*anyopaque, name: []const u8, args_json: ?[]const u8) anyerror!
 
     if (std.mem.eql(u8, name, "summarize")) {
         return
-            \\{"description":"Summarize the provided text","messages":[
-            \\  {
-            \\    "role": "user",
-            \\    "content": {
-            \\      "type": "text",
-            \\      "text": "Please summarize the following text in a concise manner:\n\n[Text will be inserted here based on the 'text' argument]"
-            \\    }
-            \\  }
-            \\]}
+        \\{"description":"Summarize the provided text","messages":[
+        \\  {
+        \\    "role": "user",
+        \\    "content": {
+        \\      "type": "text",
+        \\      "text": "Please summarize the following text in a concise manner:\n\n[Text will be inserted here based on the 'text' argument]"
+        \\    }
+        \\  }
+        \\]}
         ;
     }
 
     if (std.mem.eql(u8, name, "code-review")) {
         return
-            \\{"description":"Review code for quality and issues","messages":[
-            \\  {
-            \\    "role": "user",
-            \\    "content": {
-            \\      "type": "text",
-            \\      "text": "Please review the following code and provide feedback on:\n1. Potential bugs or issues\n2. Code style and readability\n3. Performance considerations\n4. Suggested improvements\n\n```\n[Code will be inserted here]\n```"
-            \\    }
-            \\  }
-            \\]}
+        \\{"description":"Review code for quality and issues","messages":[
+        \\  {
+        \\    "role": "user",
+        \\    "content": {
+        \\      "type": "text",
+        \\      "text": "Please review the following code and provide feedback on:\n1. Potential bugs or issues\n2. Code style and readability\n3. Performance considerations\n4. Suggested improvements\n\n```\n[Code will be inserted here]\n```"
+        \\    }
+        \\  }
+        \\]}
         ;
     }
 
     if (std.mem.eql(u8, name, "explain")) {
         return
-            \\{"description":"Explain a concept clearly","messages":[
-            \\  {
-            \\    "role": "user",
-            \\    "content": {
-            \\      "type": "text",
-            \\      "text": "Please explain the following concept:\n\n[Topic will be inserted here]\n\nProvide a clear, step-by-step explanation suitable for the specified level."
-            \\    }
-            \\  }
-            \\]}
+        \\{"description":"Explain a concept clearly","messages":[
+        \\  {
+        \\    "role": "user",
+        \\    "content": {
+        \\      "type": "text",
+        \\      "text": "Please explain the following concept:\n\n[Topic will be inserted here]\n\nProvide a clear, step-by-step explanation suitable for the specified level."
+        \\    }
+        \\  }
+        \\]}
         ;
     }
 
@@ -333,7 +333,7 @@ fn complete(_: ?*anyopaque, params_json: []const u8) anyerror![]const u8 {
     // Example: return empty completions
     // In a real implementation, parse params and return relevant suggestions
     return
-        \\{"completion":{"values":["example-completion-1","example-completion-2"],"hasMore":false}}
+    \\{"completion":{"values":["example-completion-1","example-completion-2"],"hasMore":false}}
     ;
 }
 

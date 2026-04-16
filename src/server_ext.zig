@@ -11,6 +11,29 @@ const mcp = @import("mcp");
 const log = @import("log");
 const Allocator = std.mem.Allocator;
 
+inline fn io() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
+/// Read bytes from a network stream.
+fn streamRead(stream: std.Io.net.Stream, buf: []u8) !usize {
+    return std.posix.read(stream.socket.handle, buf);
+}
+
+/// Write all bytes to a network stream.
+fn streamWriteAll(stream: std.Io.net.Stream, data: []const u8) !void {
+    var w_buf: [4096]u8 = undefined;
+    var sw = stream.writer(io(), &w_buf);
+    sw.interface.writeAll(data) catch return error.BrokenPipe;
+    sw.interface.flush() catch return error.BrokenPipe;
+}
+
+/// Close a network stream.
+fn streamClose(stream: std.Io.net.Stream) void {
+    var copy = stream;
+    copy.close(io());
+}
+
 /// Extended server with integrated metrics and WebSocket support
 pub const ExtendedServer = struct {
     /// Base MCP server
@@ -18,13 +41,13 @@ pub const ExtendedServer = struct {
     /// Integrated metrics collector
     metrics: ?*mcp.Metrics = null,
     /// WebSocket listener
-    ws_listener: ?std.net.Server = null,
+    ws_listener: ?std.Io.net.Server = null,
     /// WebSocket thread
     ws_thread: ?std.Thread = null,
     /// Active WebSocket connections
-    ws_connections: std.ArrayListUnmanaged(*mcp.WebSocketConnection) = .{},
+    ws_connections: std.ArrayListUnmanaged(*mcp.WebSocketConnection) = .empty,
     /// WebSocket mutex
-    ws_mutex: std.Thread.Mutex = .{},
+    ws_mutex: std.Io.Mutex = std.Io.Mutex.init,
     /// Shutdown flag
     shutdown: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// Logger
@@ -105,17 +128,17 @@ pub const ExtendedServer = struct {
             thread.join();
         }
         if (self.ws_listener) |*listener| {
-            listener.deinit();
+            listener.deinit(io());
         }
 
         // Close all WebSocket connections
-        self.ws_mutex.lock();
+        self.ws_mutex.lockUncancelable(io());
         for (self.ws_connections.items) |conn| {
             conn.deinit();
             self.server.allocator.destroy(conn);
         }
         self.ws_connections.deinit(self.server.allocator);
-        self.ws_mutex.unlock();
+        self.ws_mutex.unlock(io());
 
         // Free metrics
         if (self.metrics) |m| {
@@ -169,14 +192,14 @@ pub const ExtendedServer = struct {
 
     /// Start WebSocket server
     pub fn serveWebSocket(self: *ExtendedServer, config: WebSocketConfig) !u16 {
-        const address = std.net.Address.parseIp4(config.bind_address, config.port) catch
+        var address = std.Io.net.IpAddress.parseIp4(config.bind_address, config.port) catch
             return error.InvalidAddress;
 
-        self.ws_listener = try address.listen(.{
+        self.ws_listener = try std.Io.net.IpAddress.listen(&address, io(), .{
             .reuse_address = true,
         });
 
-        const actual_port = self.ws_listener.?.listen_address.getPort();
+        const actual_port = self.ws_listener.?.socket.address.getPort();
 
         if (self.logger) |l| {
             l.info("WebSocket server listening on {s}:{d}", .{ config.bind_address, actual_port });
@@ -190,31 +213,32 @@ pub const ExtendedServer = struct {
 
     fn wsAcceptLoop(self: *ExtendedServer, config: WebSocketConfig) void {
         while (!self.shutdown.load(.acquire)) {
-            const conn = self.ws_listener.?.accept() catch continue;
+            var listener = self.ws_listener orelse break;
+            const conn = listener.accept(io()) catch continue;
 
             // Check connection limit
-            self.ws_mutex.lock();
+            self.ws_mutex.lockUncancelable(io());
             if (self.ws_connections.items.len >= config.max_connections) {
-                self.ws_mutex.unlock();
-                conn.stream.close();
+                self.ws_mutex.unlock(io());
+                streamClose(conn);
                 continue;
             }
-            self.ws_mutex.unlock();
+            self.ws_mutex.unlock(io());
 
             // Spawn handler thread
-            _ = std.Thread.spawn(.{}, wsConnectionHandler, .{ self, conn.stream, config }) catch {
-                conn.stream.close();
+            _ = std.Thread.spawn(.{}, wsConnectionHandler, .{ self, conn, config }) catch {
+                streamClose(conn);
                 continue;
             };
         }
     }
 
-    fn wsConnectionHandler(self: *ExtendedServer, stream: std.net.Stream, config: WebSocketConfig) void {
+    fn wsConnectionHandler(self: *ExtendedServer, stream: std.Io.net.Stream, config: WebSocketConfig) void {
         _ = config;
         // Perform WebSocket handshake
         var buf: [4096]u8 = undefined;
-        const n = stream.read(&buf) catch {
-            stream.close();
+        const n = streamRead(stream, &buf) catch {
+            streamClose(stream);
             return;
         };
 
@@ -222,25 +246,25 @@ pub const ExtendedServer = struct {
 
         // Check for WebSocket upgrade
         if (std.mem.indexOf(u8, request, "Upgrade: websocket") == null) {
-            stream.close();
+            streamClose(stream);
             return;
         }
 
         // Extract Sec-WebSocket-Key
         const key_start = std.mem.indexOf(u8, request, "Sec-WebSocket-Key: ") orelse {
-            stream.close();
+            streamClose(stream);
             return;
         };
         const key_value_start = key_start + 19;
         const key_end = std.mem.indexOfPos(u8, request, key_value_start, "\r\n") orelse {
-            stream.close();
+            streamClose(stream);
             return;
         };
         const client_key = request[key_value_start..key_end];
 
         // Generate accept key
         const accept_key = mcp.generateWebSocketAcceptKey(client_key) catch {
-            stream.close();
+            streamClose(stream);
             return;
         };
 
@@ -253,43 +277,43 @@ pub const ExtendedServer = struct {
             \\
             \\
         , .{accept_key}) catch {
-            stream.close();
+            streamClose(stream);
             return;
         };
         defer self.server.allocator.free(response);
 
-        _ = stream.write(response) catch {
-            stream.close();
+        streamWriteAll(stream, response) catch {
+            streamClose(stream);
             return;
         };
 
         // Create session ID
         var session_id_buf: [36]u8 = undefined;
-        var prng = std.Random.DefaultPrng.init(@intCast(std.time.timestamp()));
+        var prng = std.Random.DefaultPrng.init(@intCast(std.Io.Timestamp.now(io(), .real).toSeconds()));
         for (&session_id_buf) |*c| {
             c.* = "0123456789abcdef"[prng.random().intRangeLessThan(usize, 0, 16)];
         }
 
         // Create WebSocket connection
         const ws_conn = self.server.allocator.create(mcp.WebSocketConnection) catch {
-            stream.close();
+            streamClose(stream);
             return;
         };
         ws_conn.* = mcp.WebSocketConnection.init(self.server.allocator, stream, &session_id_buf) catch {
             self.server.allocator.destroy(ws_conn);
-            stream.close();
+            streamClose(stream);
             return;
         };
 
         // Add to connections list
-        self.ws_mutex.lock();
+        self.ws_mutex.lockUncancelable(io());
         self.ws_connections.append(self.server.allocator, ws_conn) catch {
-            self.ws_mutex.unlock();
+            self.ws_mutex.unlock(io());
             ws_conn.deinit();
             self.server.allocator.destroy(ws_conn);
             return;
         };
-        self.ws_mutex.unlock();
+        self.ws_mutex.unlock(io());
 
         if (self.metrics) |m| {
             m.connectionOpened();
@@ -302,10 +326,10 @@ pub const ExtendedServer = struct {
         // Message handling loop
         var msg_buf: [65536]u8 = undefined;
         while (!self.shutdown.load(.acquire)) {
-            const msg_n = stream.read(&msg_buf) catch break;
+            const msg_n = streamRead(stream, &msg_buf) catch break;
             if (msg_n == 0) break;
 
-            const timer_start = std.time.nanoTimestamp();
+            const timer_start = std.Io.Timestamp.now(io(), .awake);
 
             // Process message
             const result = ws_conn.receiveMessage(msg_buf[0..msg_n]) catch break;
@@ -323,8 +347,9 @@ pub const ExtendedServer = struct {
                     ws_conn.sendText(msg.payload) catch break;
 
                     if (self.metrics) |m| {
-                        const latency: u64 = @intCast(std.time.nanoTimestamp() - timer_start);
-                        m.recordRequest("websocket", latency / 1000);
+                        const elapsed = timer_start.durationTo(std.Io.Timestamp.now(io(), .awake));
+                        const latency: u64 = @intCast(@divTrunc(elapsed.nanoseconds, std.time.ns_per_us));
+                        m.recordRequest("websocket", latency);
                         m.recordBytesSent(msg.payload.len);
                     }
                 } else if (msg.opcode == .ping) {
@@ -337,14 +362,14 @@ pub const ExtendedServer = struct {
         }
 
         // Remove from connections list
-        self.ws_mutex.lock();
+        self.ws_mutex.lockUncancelable(io());
         for (self.ws_connections.items, 0..) |conn, i| {
             if (conn == ws_conn) {
                 _ = self.ws_connections.orderedRemove(i);
                 break;
             }
         }
-        self.ws_mutex.unlock();
+        self.ws_mutex.unlock(io());
 
         ws_conn.deinit();
         self.server.allocator.destroy(ws_conn);
@@ -382,8 +407,8 @@ pub const ExtendedServer = struct {
 
     /// Broadcast message to all WebSocket connections
     pub fn broadcastWebSocket(self: *ExtendedServer, message: []const u8) void {
-        self.ws_mutex.lock();
-        defer self.ws_mutex.unlock();
+        self.ws_mutex.lockUncancelable(io());
+        defer self.ws_mutex.unlock(io());
 
         for (self.ws_connections.items) |conn| {
             conn.sendText(message) catch continue;
@@ -392,8 +417,8 @@ pub const ExtendedServer = struct {
 
     /// Get number of active connections
     pub fn getConnectionCount(self: *ExtendedServer) usize {
-        self.ws_mutex.lock();
-        defer self.ws_mutex.unlock();
+        self.ws_mutex.lockUncancelable(io());
+        defer self.ws_mutex.unlock(io());
         return self.ws_connections.items.len;
     }
 

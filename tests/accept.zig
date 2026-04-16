@@ -11,6 +11,31 @@ const std = @import("std");
 const mcp = @import("mcp");
 const json = @import("json");
 
+inline fn _io() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
+fn testStreamRead(stream: std.Io.net.Stream, buf: []u8) !usize {
+    return std.posix.read(stream.socket.handle, buf);
+}
+
+fn testStreamWriteAll(stream: std.Io.net.Stream, data: []const u8) !void {
+    var w_buf: [4096]u8 = undefined;
+    var sw = stream.writer(_io(), &w_buf);
+    sw.interface.writeAll(data) catch return error.BrokenPipe;
+    sw.interface.flush() catch return error.BrokenPipe;
+}
+
+fn testStreamClose(stream: std.Io.net.Stream) void {
+    var copy = stream;
+    copy.close(_io());
+}
+
+fn testConnect(port: u16) !std.Io.net.Stream {
+    var addr: std.Io.net.IpAddress = .{ .ip4 = std.Io.net.Ip4Address.loopback(port) };
+    return std.Io.net.IpAddress.connect(&addr, _io(), .{ .mode = .stream });
+}
+
 // ============================================================================
 // Test Helpers
 // ============================================================================
@@ -265,22 +290,21 @@ test "T4: HTTP bearer auth" {
     defer server.stop();
 
     // Give server time to start
-    std.Thread.sleep(10 * std.time.ns_per_ms);
+    _io().sleep(std.Io.Duration.fromMilliseconds(10), .awake) catch {};
 
     // Test 1: Request without auth should return 401
     {
-        const addr = std.net.Address.parseIp4("127.0.0.1", port) catch unreachable;
-        var stream = std.net.tcpConnectToAddress(addr) catch {
+        const stream = testConnect(port) catch {
             // Server might not be ready, skip
             return;
         };
-        defer stream.close();
+        defer testStreamClose(stream);
 
         const request = "POST /mcp HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 41\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}";
-        stream.writeAll(request) catch return;
+        testStreamWriteAll(stream, request) catch return;
 
         var buf: [1024]u8 = undefined;
-        const n = stream.read(&buf) catch return;
+        const n = testStreamRead(stream, &buf) catch return;
         const response = buf[0..n];
 
         try std.testing.expect(std.mem.indexOf(u8, response, "401") != null);
@@ -288,17 +312,16 @@ test "T4: HTTP bearer auth" {
 
     // Test 2: Request with valid bearer token should succeed
     {
-        const addr = std.net.Address.parseIp4("127.0.0.1", port) catch unreachable;
-        var stream = std.net.tcpConnectToAddress(addr) catch return;
-        defer stream.close();
+        const stream = testConnect(port) catch return;
+        defer testStreamClose(stream);
 
         var req_buf: [512]u8 = undefined;
         const request = std.fmt.bufPrint(&req_buf, "POST /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {s}\r\nContent-Type: application/json\r\nContent-Length: 41\r\n\r\n{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}}", .{test_token}) catch return;
 
-        stream.writeAll(request) catch return;
+        testStreamWriteAll(stream, request) catch return;
 
         var buf: [1024]u8 = undefined;
-        const n = stream.read(&buf) catch return;
+        const n = testStreamRead(stream, &buf) catch return;
         const response = buf[0..n];
 
         // Should get 200 OK with Mcp-Session-Id header
@@ -327,18 +350,17 @@ test "T5: HTTP oauth2 well-known endpoint" {
     defer server.stop();
 
     // Give server time to start
-    std.Thread.sleep(10 * std.time.ns_per_ms);
+    _io().sleep(std.Io.Duration.fromMilliseconds(10), .awake) catch {};
 
     // Request OAuth2 metadata
-    const addr = std.net.Address.parseIp4("127.0.0.1", port) catch unreachable;
-    var stream = std.net.tcpConnectToAddress(addr) catch return;
-    defer stream.close();
+    const stream = testConnect(port) catch return;
+    defer testStreamClose(stream);
 
     const request = "GET /.well-known/oauth-authorization-server HTTP/1.1\r\nHost: localhost\r\n\r\n";
-    stream.writeAll(request) catch return;
+    testStreamWriteAll(stream, request) catch return;
 
     var buf: [2048]u8 = undefined;
-    const n = stream.read(&buf) catch return;
+    const n = testStreamRead(stream, &buf) catch return;
     const response = buf[0..n];
 
     // Should get 200 OK
@@ -641,19 +663,18 @@ test "Origin header validation" {
     const port = try server.serveHttp();
     defer server.stop();
 
-    std.Thread.sleep(10 * std.time.ns_per_ms);
+    _io().sleep(std.Io.Duration.fromMilliseconds(10), .awake) catch {};
 
     // Test: Request with disallowed origin
     {
-        const addr = std.net.Address.parseIp4("127.0.0.1", port) catch unreachable;
-        var stream = std.net.tcpConnectToAddress(addr) catch return;
-        defer stream.close();
+        const stream = testConnect(port) catch return;
+        defer testStreamClose(stream);
 
         const request = "POST /mcp HTTP/1.1\r\nHost: localhost\r\nOrigin: http://evil.example.com\r\nContent-Type: application/json\r\nContent-Length: 41\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}";
-        stream.writeAll(request) catch return;
+        testStreamWriteAll(stream, request) catch return;
 
         var buf: [1024]u8 = undefined;
-        const n = stream.read(&buf) catch return;
+        const n = testStreamRead(stream, &buf) catch return;
         const response = buf[0..n];
 
         // Should reject with 403 Forbidden
@@ -662,15 +683,14 @@ test "Origin header validation" {
 
     // Test: Request with allowed origin
     {
-        const addr = std.net.Address.parseIp4("127.0.0.1", port) catch unreachable;
-        var stream = std.net.tcpConnectToAddress(addr) catch return;
-        defer stream.close();
+        const stream = testConnect(port) catch return;
+        defer testStreamClose(stream);
 
         const request = "POST /mcp HTTP/1.1\r\nHost: localhost\r\nOrigin: http://allowed.example.com\r\nContent-Type: application/json\r\nContent-Length: 41\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}";
-        stream.writeAll(request) catch return;
+        testStreamWriteAll(stream, request) catch return;
 
         var buf: [1024]u8 = undefined;
-        const n = stream.read(&buf) catch return;
+        const n = testStreamRead(stream, &buf) catch return;
         const response = buf[0..n];
 
         // Should succeed with 200 OK
@@ -695,16 +715,15 @@ test "Session lifecycle - create use delete" {
     const port = try server.serveHttp();
     defer server.stop();
 
-    std.Thread.sleep(10 * std.time.ns_per_ms);
+    _io().sleep(std.Io.Duration.fromMilliseconds(10), .awake) catch {};
 
     var session_id: [64]u8 = undefined;
     var session_id_len: usize = 0;
 
     // Step 1: Create session via initialize
     {
-        const addr = std.net.Address.parseIp4("127.0.0.1", port) catch unreachable;
-        var stream = std.net.tcpConnectToAddress(addr) catch return;
-        defer stream.close();
+        const stream = testConnect(port) catch return;
+        defer testStreamClose(stream);
 
         const init_body =
             \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}
@@ -712,10 +731,10 @@ test "Session lifecycle - create use delete" {
         var req_buf: [512]u8 = undefined;
         const request = std.fmt.bufPrint(&req_buf, "POST /mcp HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ init_body.len, init_body }) catch return;
 
-        stream.writeAll(request) catch return;
+        testStreamWriteAll(stream, request) catch return;
 
         var buf: [2048]u8 = undefined;
-        const n = stream.read(&buf) catch return;
+        const n = testStreamRead(stream, &buf) catch return;
         const response = buf[0..n];
 
         // Should have Mcp-Session-Id header
@@ -731,9 +750,8 @@ test "Session lifecycle - create use delete" {
 
     // Step 2: Use session with valid ID
     {
-        const addr = std.net.Address.parseIp4("127.0.0.1", port) catch unreachable;
-        var stream = std.net.tcpConnectToAddress(addr) catch return;
-        defer stream.close();
+        const stream = testConnect(port) catch return;
+        defer testStreamClose(stream);
 
         const ping_body =
             \\{"jsonrpc":"2.0","id":2,"method":"ping"}
@@ -741,10 +759,10 @@ test "Session lifecycle - create use delete" {
         var req_buf: [512]u8 = undefined;
         const request = std.fmt.bufPrint(&req_buf, "POST /mcp HTTP/1.1\r\nHost: localhost\r\nMcp-Session-Id: {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ session_id[0..session_id_len], ping_body.len, ping_body }) catch return;
 
-        stream.writeAll(request) catch return;
+        testStreamWriteAll(stream, request) catch return;
 
         var buf: [1024]u8 = undefined;
-        const n = stream.read(&buf) catch return;
+        const n = testStreamRead(stream, &buf) catch return;
         const response = buf[0..n];
 
         // Should succeed
@@ -753,17 +771,16 @@ test "Session lifecycle - create use delete" {
 
     // Step 3: Delete session
     {
-        const addr = std.net.Address.parseIp4("127.0.0.1", port) catch unreachable;
-        var stream = std.net.tcpConnectToAddress(addr) catch return;
-        defer stream.close();
+        const stream = testConnect(port) catch return;
+        defer testStreamClose(stream);
 
         var req_buf: [256]u8 = undefined;
         const request = std.fmt.bufPrint(&req_buf, "DELETE /mcp HTTP/1.1\r\nHost: localhost\r\nMcp-Session-Id: {s}\r\n\r\n", .{session_id[0..session_id_len]}) catch return;
 
-        stream.writeAll(request) catch return;
+        testStreamWriteAll(stream, request) catch return;
 
         var buf: [1024]u8 = undefined;
-        const n = stream.read(&buf) catch return;
+        const n = testStreamRead(stream, &buf) catch return;
         const response = buf[0..n];
 
         // Should get 204 No Content or 200 OK
@@ -772,9 +789,8 @@ test "Session lifecycle - create use delete" {
 
     // Step 4: Request with deleted session should fail
     {
-        const addr = std.net.Address.parseIp4("127.0.0.1", port) catch unreachable;
-        var stream = std.net.tcpConnectToAddress(addr) catch return;
-        defer stream.close();
+        const stream = testConnect(port) catch return;
+        defer testStreamClose(stream);
 
         const ping_body =
             \\{"jsonrpc":"2.0","id":3,"method":"ping"}
@@ -782,10 +798,10 @@ test "Session lifecycle - create use delete" {
         var req_buf: [512]u8 = undefined;
         const request = std.fmt.bufPrint(&req_buf, "POST /mcp HTTP/1.1\r\nHost: localhost\r\nMcp-Session-Id: {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ session_id[0..session_id_len], ping_body.len, ping_body }) catch return;
 
-        stream.writeAll(request) catch return;
+        testStreamWriteAll(stream, request) catch return;
 
         var buf: [1024]u8 = undefined;
-        const n = stream.read(&buf) catch return;
+        const n = testStreamRead(stream, &buf) catch return;
         const response = buf[0..n];
 
         // Should get 404 for invalid session
@@ -920,17 +936,16 @@ test "MCP-Protocol-Version header in response" {
     const port = try server.serveHttp();
     defer server.stop();
 
-    std.Thread.sleep(10 * std.time.ns_per_ms);
+    _io().sleep(std.Io.Duration.fromMilliseconds(10), .awake) catch {};
 
-    const addr = std.net.Address.parseIp4("127.0.0.1", port) catch unreachable;
-    var stream = std.net.tcpConnectToAddress(addr) catch return;
-    defer stream.close();
+    const stream = testConnect(port) catch return;
+    defer testStreamClose(stream);
 
     const request = "POST /mcp HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 41\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}";
-    stream.writeAll(request) catch return;
+    testStreamWriteAll(stream, request) catch return;
 
     var buf: [2048]u8 = undefined;
-    const n = stream.read(&buf) catch return;
+    const n = testStreamRead(stream, &buf) catch return;
     const response = buf[0..n];
 
     // Should have MCP-Protocol-Version header

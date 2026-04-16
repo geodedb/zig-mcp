@@ -9,6 +9,10 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+inline fn io() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
 /// Log levels in order of severity
 pub const Level = enum(u8) {
     trace = 0,
@@ -113,7 +117,7 @@ pub const Config = struct {
     /// Include source location
     source_location: bool = false,
     /// Output writer (null = stderr)
-    writer: ?std.io.AnyWriter = null,
+    writer: ?*std.Io.Writer = null,
     /// Color output (for text format)
     color: bool = true,
 };
@@ -220,7 +224,7 @@ pub const Logger = struct {
     ) void {
         // Timestamp
         if (self.config.timestamps) {
-            const ts = std.time.timestamp();
+            const ts = std.Io.Timestamp.now(io(), .real).toSeconds();
             std.debug.print("{d} ", .{ts});
         }
 
@@ -262,7 +266,7 @@ pub const Logger = struct {
 
     fn writeText(
         self: *const Logger,
-        writer: std.io.AnyWriter,
+        writer: *std.Io.Writer,
         level: Level,
         comptime fmt: []const u8,
         args: anytype,
@@ -270,7 +274,7 @@ pub const Logger = struct {
     ) void {
         // Timestamp
         if (self.config.timestamps) {
-            const ts = std.time.timestamp();
+            const ts = std.Io.Timestamp.now(io(), .real).toSeconds();
             writer.print("{d} ", .{ts}) catch return;
         }
 
@@ -312,7 +316,7 @@ pub const Logger = struct {
 
     fn writeJson(
         self: *const Logger,
-        writer: std.io.AnyWriter,
+        writer: *std.Io.Writer,
         level: Level,
         comptime fmt: []const u8,
         args: anytype,
@@ -322,7 +326,7 @@ pub const Logger = struct {
 
         // Timestamp
         if (self.config.timestamps) {
-            const ts = std.time.timestamp();
+            const ts = std.Io.Timestamp.now(io(), .real).toSeconds();
             writer.print("\"ts\":{d},", .{ts}) catch return;
         }
 
@@ -375,7 +379,7 @@ pub const Logger = struct {
 
     fn writeCompact(
         self: *const Logger,
-        writer: std.io.AnyWriter,
+        writer: *std.Io.Writer,
         level: Level,
         comptime fmt: []const u8,
         args: anytype,
@@ -470,51 +474,51 @@ pub fn boolean(key: []const u8, value: bool) Field {
 
 test "logger level filtering" {
     var buf: [1024]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
+    var fbs: std.Io.Writer = .fixed(&buf);
 
     var logger = Logger.init(std.testing.allocator, "test", .{
         .level = .warn,
         .format = .compact,
         .timestamps = false,
-        .writer = fbs.writer().any(),
+        .writer = &fbs,
     });
 
     logger.debug("debug message", .{});
     logger.warn("warn message", .{});
 
-    const output = fbs.getWritten();
+    const output = fbs.buffered();
     try std.testing.expect(std.mem.indexOf(u8, output, "debug") == null);
     try std.testing.expect(std.mem.indexOf(u8, output, "warn") != null);
 }
 
 test "logger json format" {
     var buf: [1024]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
+    var fbs: std.Io.Writer = .fixed(&buf);
 
     var logger = Logger.init(std.testing.allocator, "test", .{
         .level = .info,
         .format = .json,
         .timestamps = false,
-        .writer = fbs.writer().any(),
+        .writer = &fbs,
     });
 
     logger.info("test message", .{});
 
-    const output = fbs.getWritten();
+    const output = fbs.buffered();
     try std.testing.expect(std.mem.indexOf(u8, output, "\"level\":\"INFO\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "\"msg\":\"test message\"") != null);
 }
 
 test "logger with fields" {
     var buf: [1024]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
+    var fbs: std.Io.Writer = .fixed(&buf);
 
     var logger = Logger.init(std.testing.allocator, "test", .{
         .level = .info,
         .format = .text,
         .timestamps = false,
         .color = false,
-        .writer = fbs.writer().any(),
+        .writer = &fbs,
     });
 
     logger.logWithFields(.info, "request", .{}, &.{
@@ -522,7 +526,7 @@ test "logger with fields" {
         int("status", 200),
     });
 
-    const output = fbs.getWritten();
+    const output = fbs.buffered();
     try std.testing.expect(std.mem.indexOf(u8, output, "method=\"GET\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "status=200") != null);
 }

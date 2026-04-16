@@ -56,7 +56,7 @@ fn runBearerServer(allocator: std.mem.Allocator) !void {
 
     // Keep running
     while (true) {
-        std.Thread.sleep(std.time.ns_per_s);
+        std.Io.Threaded.global_single_threaded.io().sleep(std.Io.Duration.fromSeconds(1), .awake) catch {};
     }
 }
 
@@ -85,7 +85,7 @@ fn runBasicServer(allocator: std.mem.Allocator) !void {
     std.debug.print("Username: admin, Password: secretpassword\n\n", .{});
 
     while (true) {
-        std.Thread.sleep(std.time.ns_per_s);
+        std.Io.Threaded.global_single_threaded.io().sleep(std.Io.Duration.fromSeconds(1), .awake) catch {};
     }
 }
 
@@ -118,21 +118,16 @@ fn runOAuthServer(allocator: std.mem.Allocator) !void {
     std.debug.print("  Register:  http://localhost:{d}/mcp/register\n\n", .{port});
 
     while (true) {
-        std.Thread.sleep(std.time.ns_per_s);
+        std.Io.Threaded.global_single_threaded.io().sleep(std.Io.Duration.fromSeconds(1), .awake) catch {};
     }
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
 
     // Parse command line to determine which auth mode to demo
-    var args = try std.process.argsWithAllocator(allocator);
-    defer args.deinit();
-    _ = args.skip(); // Skip program name
-
-    const mode = args.next() orelse "bearer";
+    const argv = try init.minimal.args.toSlice(init.arena.allocator());
+    const mode: []const u8 = if (argv.len > 1) argv[1] else "bearer";
 
     std.debug.print("\n=== MCP Authentication Example ===\n\n", .{});
 
@@ -190,14 +185,14 @@ fn createMinimalHandler() mcp.Handler {
 
 fn listTools(_: ?*anyopaque, _: ?[]const u8) anyerror![]const u8 {
     return
-        \\{"tools":[{"name":"whoami","description":"Returns information about the authenticated session","inputSchema":{"type":"object","properties":{}}}]}
+    \\{"tools":[{"name":"whoami","description":"Returns information about the authenticated session","inputSchema":{"type":"object","properties":{}}}]}
     ;
 }
 
 fn callTool(_: ?*anyopaque, name: []const u8, _: []const u8, _: *const mcp.CancelToken) anyerror![]const u8 {
     if (std.mem.eql(u8, name, "whoami")) {
         return
-            \\{"content":[{"type":"text","text":"You are authenticated! Session info would appear here."}]}
+        \\{"content":[{"type":"text","text":"You are authenticated! Session info would appear here."}]}
         ;
     }
     return error.ToolNotFound;

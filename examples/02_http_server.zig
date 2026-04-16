@@ -26,7 +26,7 @@ const std = @import("std");
 const mcp = @import("mcp");
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -76,7 +76,7 @@ pub fn main() !void {
     // Keep the main thread alive
     // In a real application, you might want to handle signals properly
     while (true) {
-        std.Thread.sleep(std.time.ns_per_s);
+        std.Io.Threaded.global_single_threaded.io().sleep(std.Io.Duration.fromSeconds(1), .awake) catch {};
     }
 }
 
@@ -104,49 +104,49 @@ fn createHandler() mcp.Handler {
 fn listTools(_: ?*anyopaque, _: ?[]const u8) anyerror![]const u8 {
     // Multiple tools demonstrating different capabilities
     return
-        \\{"tools":[
-        \\  {
-        \\    "name": "calculator",
-        \\    "description": "Performs basic arithmetic operations",
-        \\    "inputSchema": {
-        \\      "type": "object",
-        \\      "properties": {
-        \\        "operation": {
-        \\          "type": "string",
-        \\          "enum": ["add", "subtract", "multiply", "divide"],
-        \\          "description": "The operation to perform"
-        \\        },
-        \\        "a": { "type": "number", "description": "First operand" },
-        \\        "b": { "type": "number", "description": "Second operand" }
-        \\      },
-        \\      "required": ["operation", "a", "b"]
-        \\    }
-        \\  },
-        \\  {
-        \\    "name": "greeting",
-        \\    "description": "Generates a personalized greeting",
-        \\    "inputSchema": {
-        \\      "type": "object",
-        \\      "properties": {
-        \\        "name": { "type": "string", "description": "Name to greet" },
-        \\        "style": {
-        \\          "type": "string",
-        \\          "enum": ["formal", "casual", "enthusiastic"],
-        \\          "default": "casual"
-        \\        }
-        \\      },
-        \\      "required": ["name"]
-        \\    }
-        \\  },
-        \\  {
-        \\    "name": "timestamp",
-        \\    "description": "Returns the current server timestamp",
-        \\    "inputSchema": {
-        \\      "type": "object",
-        \\      "properties": {}
-        \\    }
-        \\  }
-        \\]}
+    \\{"tools":[
+    \\  {
+    \\    "name": "calculator",
+    \\    "description": "Performs basic arithmetic operations",
+    \\    "inputSchema": {
+    \\      "type": "object",
+    \\      "properties": {
+    \\        "operation": {
+    \\          "type": "string",
+    \\          "enum": ["add", "subtract", "multiply", "divide"],
+    \\          "description": "The operation to perform"
+    \\        },
+    \\        "a": { "type": "number", "description": "First operand" },
+    \\        "b": { "type": "number", "description": "Second operand" }
+    \\      },
+    \\      "required": ["operation", "a", "b"]
+    \\    }
+    \\  },
+    \\  {
+    \\    "name": "greeting",
+    \\    "description": "Generates a personalized greeting",
+    \\    "inputSchema": {
+    \\      "type": "object",
+    \\      "properties": {
+    \\        "name": { "type": "string", "description": "Name to greet" },
+    \\        "style": {
+    \\          "type": "string",
+    \\          "enum": ["formal", "casual", "enthusiastic"],
+    \\          "default": "casual"
+    \\        }
+    \\      },
+    \\      "required": ["name"]
+    \\    }
+    \\  },
+    \\  {
+    \\    "name": "timestamp",
+    \\    "description": "Returns the current server timestamp",
+    \\    "inputSchema": {
+    \\      "type": "object",
+    \\      "properties": {}
+    \\    }
+    \\  }
+    \\]}
     ;
 }
 
@@ -164,19 +164,19 @@ fn callTool(
     if (std.mem.eql(u8, name, "calculator")) {
         // In a real implementation, parse args_json and compute result
         return
-            \\{"content":[{"type":"text","text":"Calculator result: 42"}]}
+        \\{"content":[{"type":"text","text":"Calculator result: 42"}]}
         ;
     }
 
     if (std.mem.eql(u8, name, "greeting")) {
         return
-            \\{"content":[{"type":"text","text":"Hello! Nice to meet you!"}]}
+        \\{"content":[{"type":"text","text":"Hello! Nice to meet you!"}]}
         ;
     }
 
     if (std.mem.eql(u8, name, "timestamp")) {
         return
-            \\{"content":[{"type":"text","text":"Current timestamp: 2025-01-24T12:00:00Z"}]}
+        \\{"content":[{"type":"text","text":"Current timestamp: 2025-01-24T12:00:00Z"}]}
         ;
     }
 

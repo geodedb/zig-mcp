@@ -14,6 +14,10 @@ const std = @import("std");
 const json = @import("json");
 const mcp = @import("mcp");
 
+inline fn _io() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
 /// Benchmark result statistics
 pub const BenchResult = struct {
     name: []const u8,
@@ -67,15 +71,16 @@ pub const BenchConfig = struct {
 
 /// Timer for benchmarking
 pub const Timer = struct {
-    start_time: i128,
+    start_ts: std.Io.Timestamp,
 
     pub fn start() Timer {
-        return .{ .start_time = std.time.nanoTimestamp() };
+        return .{ .start_ts = std.Io.Timestamp.now(_io(), .awake) };
     }
 
     pub fn elapsed(self: Timer) u64 {
-        const end = std.time.nanoTimestamp();
-        return @intCast(end - self.start_time);
+        const now_ts = std.Io.Timestamp.now(_io(), .awake);
+        const dur = self.start_ts.durationTo(now_ts);
+        return @intCast(dur.nanoseconds);
     }
 };
 
@@ -102,9 +107,10 @@ pub fn runBenchmark(
 
     const timer = Timer.start();
     while (result.total_time_ns < config.min_duration_ns and result.iterations < config.max_iterations) {
-        const iter_start = std.time.nanoTimestamp();
+        const iter_start = std.Io.Timestamp.now(_io(), .awake);
         result.total_bytes += benchFn(&allocator);
-        const iter_time: u64 = @intCast(std.time.nanoTimestamp() - iter_start);
+        const iter_elapsed = iter_start.durationTo(std.Io.Timestamp.now(_io(), .awake));
+        const iter_time: u64 = @intCast(iter_elapsed.nanoseconds);
 
         result.min_ns = @min(result.min_ns, iter_time);
         result.max_ns = @max(result.max_ns, iter_time);
@@ -265,7 +271,7 @@ fn benchArenaAlloc(allocator: *std.mem.Allocator) u64 {
 }
 
 fn benchGeneralPurposeAlloc(_: *std.mem.Allocator) u64 {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
@@ -289,13 +295,14 @@ fn benchGeneralPurposeAlloc(_: *std.mem.Allocator) u64 {
 // ============================================================================
 
 fn benchMutexContention(_: *std.mem.Allocator) u64 {
-    var mutex = std.Thread.Mutex{};
+    const bench_io = std.Io.Threaded.global_single_threaded.io();
+    var mutex: std.Io.Mutex = std.Io.Mutex.init;
     var counter: u64 = 0;
 
     for (0..1000) |_| {
-        mutex.lock();
+        mutex.lockUncancelable(bench_io);
         counter += 1;
-        mutex.unlock();
+        mutex.unlock(bench_io);
     }
 
     return counter;
@@ -305,18 +312,12 @@ fn benchMutexContention(_: *std.mem.Allocator) u64 {
 // Main Entry Point
 // ============================================================================
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     std.debug.print("MCP Performance Benchmarks\n", .{});
     std.debug.print("==========================\n\n", .{});
 
-    // Use heap allocator for Windows compatibility
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    var args = try std.process.argsWithAllocator(allocator);
-    defer args.deinit();
-    _ = args.skip();
+    const argv = try init.minimal.args.toSlice(init.arena.allocator());
+    var arg_idx: usize = 1; // skip program name
 
     var run_all = true;
     var run_json = false;
@@ -324,7 +325,8 @@ pub fn main() !void {
     var run_http = false;
     var run_memory = false;
 
-    while (args.next()) |arg| {
+    while (arg_idx < argv.len) : (arg_idx += 1) {
+        const arg = argv[arg_idx];
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printUsage();
             return;

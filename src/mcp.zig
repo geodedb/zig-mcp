@@ -19,6 +19,29 @@ const json = @import("json");
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 
+inline fn io() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
+/// Read bytes from a network stream using posix read on the underlying fd.
+fn streamRead(stream: std.Io.net.Stream, buf: []u8) !usize {
+    return std.posix.read(stream.socket.handle, buf);
+}
+
+/// Write all bytes to a network stream via the Io writer interface.
+fn streamWriteAll(stream: std.Io.net.Stream, data: []const u8) !void {
+    var w_buf: [4096]u8 = undefined;
+    var sw = stream.writer(io(), &w_buf);
+    sw.interface.writeAll(data) catch return error.BrokenPipe;
+    sw.interface.flush() catch return error.BrokenPipe;
+}
+
+/// Close a network stream.
+fn streamClose(stream: std.Io.net.Stream) void {
+    var copy = stream;
+    copy.close(io());
+}
+
 // ============================================================================
 // Public Constants
 // ============================================================================
@@ -207,7 +230,7 @@ pub const HttpClient = struct {
         options: RequestOptions,
     ) !Response {
         // Build extra headers if provided
-        var extra_headers_list = std.ArrayListUnmanaged(std.http.Header){};
+        var extra_headers_list = std.ArrayListUnmanaged(std.http.Header).empty;
         defer extra_headers_list.deinit(self.allocator);
 
         if (options.headers) |hdrs| {
@@ -220,7 +243,7 @@ pub const HttpClient = struct {
         }
 
         // Allocate response buffer
-        var response_body = std.ArrayListUnmanaged(u8){};
+        var response_body = std.ArrayListUnmanaged(u8).empty;
         errdefer response_body.deinit(self.allocator);
 
         // Use fetch for simpler request handling
@@ -475,13 +498,13 @@ pub const WebSocketFrame = struct {
 /// WebSocket connection handler for MCP transport
 pub const WebSocketConnection = struct {
     allocator: Allocator,
-    stream: std.net.Stream,
+    stream: std.Io.net.Stream,
     session_id: []const u8,
     is_open: bool = true,
-    fragment_buffer: std.ArrayListUnmanaged(u8) = .{},
+    fragment_buffer: std.ArrayListUnmanaged(u8) = .empty,
     fragment_opcode: ?WebSocketOpcode = null,
 
-    pub fn init(allocator: Allocator, stream: std.net.Stream, session_id: []const u8) !WebSocketConnection {
+    pub fn init(allocator: Allocator, stream: std.Io.net.Stream, session_id: []const u8) !WebSocketConnection {
         const sid_copy = try allocator.dupe(u8, session_id);
         return .{
             .allocator = allocator,
@@ -493,21 +516,21 @@ pub const WebSocketConnection = struct {
     pub fn deinit(self: *WebSocketConnection) void {
         self.fragment_buffer.deinit(self.allocator);
         self.allocator.free(self.session_id);
-        self.stream.close();
+        streamClose(self.stream);
     }
 
     /// Send a text message
     pub fn sendText(self: *WebSocketConnection, message: []const u8) !void {
         const frame = try WebSocketFrame.encode(self.allocator, .text, message, true, false);
         defer self.allocator.free(frame);
-        try self.stream.writeAll(frame);
+        try streamWriteAll(self.stream, frame);
     }
 
     /// Send a binary message
     pub fn sendBinary(self: *WebSocketConnection, data: []const u8) !void {
         const frame = try WebSocketFrame.encode(self.allocator, .binary, data, true, false);
         defer self.allocator.free(frame);
-        try self.stream.writeAll(frame);
+        try streamWriteAll(self.stream, frame);
     }
 
     /// Send a close frame
@@ -518,7 +541,7 @@ pub const WebSocketConnection = struct {
         payload[1] = @truncate(code_int);
         const frame = try WebSocketFrame.encode(self.allocator, .close, &payload, true, false);
         defer self.allocator.free(frame);
-        self.stream.writeAll(frame) catch {};
+        streamWriteAll(self.stream, frame) catch {};
         self.is_open = false;
     }
 
@@ -526,14 +549,14 @@ pub const WebSocketConnection = struct {
     pub fn sendPing(self: *WebSocketConnection, data: []const u8) !void {
         const frame = try WebSocketFrame.encode(self.allocator, .ping, data, true, false);
         defer self.allocator.free(frame);
-        try self.stream.writeAll(frame);
+        try streamWriteAll(self.stream, frame);
     }
 
     /// Send a pong frame
     pub fn sendPong(self: *WebSocketConnection, data: []const u8) !void {
         const frame = try WebSocketFrame.encode(self.allocator, .pong, data, true, false);
         defer self.allocator.free(frame);
-        try self.stream.writeAll(frame);
+        try streamWriteAll(self.stream, frame);
     }
 
     /// Read and process a WebSocket frame, returning the complete message payload
@@ -685,7 +708,7 @@ pub const Metrics = struct {
     /// Total bytes sent
     bytes_sent: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     /// Mutex for non-atomic operations
-    mutex: std.Thread.Mutex = .{},
+    mutex: std.Io.Mutex = std.Io.Mutex.init,
     /// Allocator for hash maps
     allocator: Allocator,
 
@@ -700,8 +723,8 @@ pub const Metrics = struct {
 
     /// Record a request
     pub fn recordRequest(self: *Metrics, method: []const u8, latency_us: u64) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(io());
+        defer self.mutex.unlock(io());
 
         // Increment request count
         if (self.requests_total.getPtr(method)) |count| {
@@ -723,8 +746,8 @@ pub const Metrics = struct {
 
     /// Record an error
     pub fn recordError(self: *Metrics, error_code: []const u8) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(io());
+        defer self.mutex.unlock(io());
 
         if (self.errors_total.getPtr(error_code)) |count| {
             count.* += 1;
@@ -753,55 +776,54 @@ pub const Metrics = struct {
 
     /// Export metrics in Prometheus format
     pub fn exportPrometheus(self: *Metrics, alloc: Allocator) ![]const u8 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(io());
+        defer self.mutex.unlock(io());
 
-        var buf = std.ArrayListUnmanaged(u8){};
+        var buf = std.ArrayListUnmanaged(u8).empty;
         errdefer buf.deinit(alloc);
-        const writer = buf.writer(alloc);
 
         // Active connections
-        try writer.writeAll("# HELP mcp_active_connections Current number of active connections\n");
-        try writer.writeAll("# TYPE mcp_active_connections gauge\n");
-        try std.fmt.format(writer, "mcp_active_connections {d}\n\n", .{self.active_connections.load(.monotonic)});
+        try buf.appendSlice(alloc, "# HELP mcp_active_connections Current number of active connections\n");
+        try buf.appendSlice(alloc, "# TYPE mcp_active_connections gauge\n");
+        try buf.print(alloc, "mcp_active_connections {d}\n\n", .{self.active_connections.load(.monotonic)});
 
         // Bytes counters
-        try writer.writeAll("# HELP mcp_bytes_received_total Total bytes received\n");
-        try writer.writeAll("# TYPE mcp_bytes_received_total counter\n");
-        try std.fmt.format(writer, "mcp_bytes_received_total {d}\n\n", .{self.bytes_received.load(.monotonic)});
+        try buf.appendSlice(alloc, "# HELP mcp_bytes_received_total Total bytes received\n");
+        try buf.appendSlice(alloc, "# TYPE mcp_bytes_received_total counter\n");
+        try buf.print(alloc, "mcp_bytes_received_total {d}\n\n", .{self.bytes_received.load(.monotonic)});
 
-        try writer.writeAll("# HELP mcp_bytes_sent_total Total bytes sent\n");
-        try writer.writeAll("# TYPE mcp_bytes_sent_total counter\n");
-        try std.fmt.format(writer, "mcp_bytes_sent_total {d}\n\n", .{self.bytes_sent.load(.monotonic)});
+        try buf.appendSlice(alloc, "# HELP mcp_bytes_sent_total Total bytes sent\n");
+        try buf.appendSlice(alloc, "# TYPE mcp_bytes_sent_total counter\n");
+        try buf.print(alloc, "mcp_bytes_sent_total {d}\n\n", .{self.bytes_sent.load(.monotonic)});
 
         // Request counts by method
-        try writer.writeAll("# HELP mcp_requests_total Total requests by method\n");
-        try writer.writeAll("# TYPE mcp_requests_total counter\n");
+        try buf.appendSlice(alloc, "# HELP mcp_requests_total Total requests by method\n");
+        try buf.appendSlice(alloc, "# TYPE mcp_requests_total counter\n");
         var req_iter = self.requests_total.iterator();
         while (req_iter.next()) |entry| {
-            try std.fmt.format(writer, "mcp_requests_total{{method=\"{s}\"}} {d}\n", .{ entry.key_ptr.*, entry.value_ptr.* });
+            try buf.print(alloc, "mcp_requests_total{{method=\"{s}\"}} {d}\n", .{ entry.key_ptr.*, entry.value_ptr.* });
         }
-        try writer.writeByte('\n');
+        try buf.append(alloc, '\n');
 
         // Error counts
-        try writer.writeAll("# HELP mcp_errors_total Total errors by code\n");
-        try writer.writeAll("# TYPE mcp_errors_total counter\n");
+        try buf.appendSlice(alloc, "# HELP mcp_errors_total Total errors by code\n");
+        try buf.appendSlice(alloc, "# TYPE mcp_errors_total counter\n");
         var err_iter = self.errors_total.iterator();
         while (err_iter.next()) |entry| {
-            try std.fmt.format(writer, "mcp_errors_total{{code=\"{s}\"}} {d}\n", .{ entry.key_ptr.*, entry.value_ptr.* });
+            try buf.print(alloc, "mcp_errors_total{{code=\"{s}\"}} {d}\n", .{ entry.key_ptr.*, entry.value_ptr.* });
         }
-        try writer.writeByte('\n');
+        try buf.append(alloc, '\n');
 
         // Latency histogram
-        try writer.writeAll("# HELP mcp_request_latency_microseconds Request latency histogram\n");
-        try writer.writeAll("# TYPE mcp_request_latency_microseconds histogram\n");
+        try buf.appendSlice(alloc, "# HELP mcp_request_latency_microseconds Request latency histogram\n");
+        try buf.appendSlice(alloc, "# TYPE mcp_request_latency_microseconds histogram\n");
         var cumulative: u64 = 0;
         for (self.bucket_boundaries, 0..) |boundary, i| {
             cumulative += self.latency_buckets[i];
-            try std.fmt.format(writer, "mcp_request_latency_microseconds_bucket{{le=\"{d}\"}} {d}\n", .{ boundary, cumulative });
+            try buf.print(alloc, "mcp_request_latency_microseconds_bucket{{le=\"{d}\"}} {d}\n", .{ boundary, cumulative });
         }
         cumulative += self.latency_buckets[self.bucket_boundaries.len];
-        try std.fmt.format(writer, "mcp_request_latency_microseconds_bucket{{le=\"+Inf\"}} {d}\n", .{cumulative});
+        try buf.print(alloc, "mcp_request_latency_microseconds_bucket{{le=\"+Inf\"}} {d}\n", .{cumulative});
 
         return buf.toOwnedSlice(alloc);
     }
@@ -812,7 +834,7 @@ pub const Trace = struct {
     id: u64,
     method: []const u8,
     start_time: i64,
-    spans: std.ArrayListUnmanaged(Span) = .{},
+    spans: std.ArrayListUnmanaged(Span) = .empty,
     alloc: Allocator,
 
     pub const Span = struct {
@@ -882,29 +904,28 @@ pub const HealthCheck = struct {
 
     /// Export health check as JSON
     pub fn toJson(self: *const HealthCheck, alloc: Allocator) ![]const u8 {
-        var buf = std.ArrayListUnmanaged(u8){};
+        var buf = std.ArrayListUnmanaged(u8).empty;
         errdefer buf.deinit(alloc);
-        const writer = buf.writer(alloc);
 
-        try writer.writeAll("{\"status\":\"");
-        try writer.writeAll(self.status.toString());
-        try writer.writeAll("\",\"version\":\"");
-        try writer.writeAll(self.version);
-        try std.fmt.format(writer, "\",\"uptime_seconds\":{d}", .{self.uptime_seconds});
+        try buf.appendSlice(alloc, "{\"status\":\"");
+        try buf.appendSlice(alloc, self.status.toString());
+        try buf.appendSlice(alloc, "\",\"version\":\"");
+        try buf.appendSlice(alloc, self.version);
+        try buf.print(alloc, "\",\"uptime_seconds\":{d}", .{self.uptime_seconds});
 
         if (self.checks.count() > 0) {
-            try writer.writeAll(",\"checks\":{");
+            try buf.appendSlice(alloc, ",\"checks\":{");
             var first = true;
             var iter = self.checks.iterator();
             while (iter.next()) |entry| {
-                if (!first) try writer.writeByte(',');
+                if (!first) try buf.append(alloc, ',');
                 first = false;
-                try std.fmt.format(writer, "\"{s}\":\"{s}\"", .{ entry.key_ptr.*, entry.value_ptr.*.toString() });
+                try buf.print(alloc, "\"{s}\":\"{s}\"", .{ entry.key_ptr.*, entry.value_ptr.*.toString() });
             }
-            try writer.writeByte('}');
+            try buf.append(alloc, '}');
         }
 
-        try writer.writeByte('}');
+        try buf.append(alloc, '}');
         return buf.toOwnedSlice(alloc);
     }
 };
@@ -927,13 +948,13 @@ pub const Session = struct {
     session_id: ?[]const u8 = null,
     pending_requests: std.AutoHashMap(i64, *RequestContext),
     next_request_id: std.atomic.Value(i64) = std.atomic.Value(i64).init(1),
-    mutex: std.Thread.Mutex = .{},
+    mutex: std.Io.Mutex = std.Io.Mutex.init,
 
     const RequestContext = struct {
         id: i64,
         response: ?[]const u8 = null,
         err: ?anyerror = null,
-        done: std.Thread.ResetEvent = .{},
+        done: std.Io.Event = .unset,
     };
 
     pub fn init(allocator: Allocator, server: *Server) Session {
@@ -963,13 +984,13 @@ pub const Session = struct {
         var ctx = RequestContext{ .id = id };
 
         {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(io());
+            defer self.mutex.unlock(io());
             try self.pending_requests.put(id, &ctx);
         }
         defer {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(io());
+            defer self.mutex.unlock(io());
             _ = self.pending_requests.remove(id);
         }
 
@@ -979,44 +1000,42 @@ pub const Session = struct {
 
         // Wait for response with timeout
         const timeout_ns: u64 = @as(u64, timeout_ms) * std.time.ns_per_ms;
-        ctx.done.timedWait(timeout_ns) catch return error.Timeout;
+        ctx.done.waitTimeout(io(), .{ .duration = std.Io.Duration.fromNanoseconds(@intCast(timeout_ns)) }) catch return error.Timeout;
 
         if (ctx.err) |e| return e;
         return ctx.response orelse error.NoResponse;
     }
 
     fn buildNotification(self: *Session, method: []const u8, params_json: ?[]const u8) ![]u8 {
-        var buf = std.ArrayListUnmanaged(u8){};
+        var buf = std.ArrayListUnmanaged(u8).empty;
         errdefer buf.deinit(self.allocator);
-        const writer = buf.writer(self.allocator);
 
-        try writer.writeAll("{\"jsonrpc\":\"2.0\",\"method\":\"");
-        try writer.writeAll(method);
-        try writer.writeByte('"');
+        try buf.appendSlice(self.allocator, "{\"jsonrpc\":\"2.0\",\"method\":\"");
+        try buf.appendSlice(self.allocator, method);
+        try buf.append(self.allocator, '"');
         if (params_json) |p| {
-            try writer.writeAll(",\"params\":");
-            try writer.writeAll(p);
+            try buf.appendSlice(self.allocator, ",\"params\":");
+            try buf.appendSlice(self.allocator, p);
         }
-        try writer.writeByte('}');
+        try buf.append(self.allocator, '}');
 
         return buf.toOwnedSlice(self.allocator);
     }
 
     fn buildRequest(self: *Session, id: i64, method: []const u8, params_json: ?[]const u8) ![]u8 {
-        var buf = std.ArrayListUnmanaged(u8){};
+        var buf = std.ArrayListUnmanaged(u8).empty;
         errdefer buf.deinit(self.allocator);
-        const writer = buf.writer(self.allocator);
 
-        try writer.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
-        try std.fmt.format(writer, "{d}", .{id});
-        try writer.writeAll(",\"method\":\"");
-        try writer.writeAll(method);
-        try writer.writeByte('"');
+        try buf.appendSlice(self.allocator, "{\"jsonrpc\":\"2.0\",\"id\":");
+        try buf.print(self.allocator, "{d}", .{id});
+        try buf.appendSlice(self.allocator, ",\"method\":\"");
+        try buf.appendSlice(self.allocator, method);
+        try buf.append(self.allocator, '"');
         if (params_json) |p| {
-            try writer.writeAll(",\"params\":");
-            try writer.writeAll(p);
+            try buf.appendSlice(self.allocator, ",\"params\":");
+            try buf.appendSlice(self.allocator, p);
         }
-        try writer.writeByte('}');
+        try buf.append(self.allocator, '}');
 
         return buf.toOwnedSlice(self.allocator);
     }
@@ -1088,9 +1107,8 @@ pub const Task = struct {
     method: []const u8, // Original method name
 
     pub fn toJson(self: *const Task, allocator: Allocator) ![]const u8 {
-        var buf = std.ArrayListUnmanaged(u8){};
-        const writer = buf.writer(allocator);
-        try std.fmt.format(writer,
+        var buf = std.ArrayListUnmanaged(u8).empty;
+        try buf.print(allocator,
             \\{{"taskId":"{s}","status":"{s}","createdAt":{d},"lastUpdatedAt":{d},"ttl":{d},"pollInterval":{d}}}
         , .{
             self.id,
@@ -1273,12 +1291,12 @@ const SseEventBuffer = struct {
     /// Lowest event ID still in buffer (for fast rejection of old IDs)
     min_event_id: u64 = 0,
     /// Mutex for thread-safe access
-    mutex: std.Thread.Mutex = .{},
+    mutex: std.Io.Mutex = std.Io.Mutex.init,
 
     /// Store a new event in the buffer
     pub fn store(self: *SseEventBuffer, allocator: Allocator, event_id: u64, data: []const u8) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(io());
+        defer self.mutex.unlock(io());
 
         // Free old event at this position if present
         if (self.events[self.write_pos]) |*old_event| {
@@ -1302,8 +1320,8 @@ const SseEventBuffer = struct {
     /// Get events after a given event ID for replay
     /// Returns events that should be replayed, caller must NOT free the data slices
     pub fn getEventsAfter(self: *SseEventBuffer, after_id: u64, out: []Event, max_count: usize) usize {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(io());
+        defer self.mutex.unlock(io());
 
         // Quick reject if ID is too old
         if (after_id > 0 and after_id < self.min_event_id) {
@@ -1333,8 +1351,8 @@ const SseEventBuffer = struct {
 
     /// Clean up all stored events
     pub fn deinit(self: *SseEventBuffer) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(io());
+        defer self.mutex.unlock(io());
 
         for (&self.events) |*maybe_event| {
             if (maybe_event.*) |*event| {
@@ -1361,14 +1379,14 @@ pub const Server = struct {
     client_protocol_version: ?[]const u8 = null,
 
     // Transport state
-    http_listener: ?std.net.Server = null,
+    http_listener: ?std.Io.net.Server = null,
     http_thread: ?std.Thread = null,
-    sse_connections: std.ArrayListUnmanaged(*SseConnection) = .{},
-    sse_mutex: std.Thread.Mutex = .{},
+    sse_connections: std.ArrayListUnmanaged(*SseConnection) = .empty,
+    sse_mutex: std.Io.Mutex = std.Io.Mutex.init,
 
     // Session tracking (GAP-011/012)
     active_sessions: std.StringHashMapUnmanaged(void) = .{},
-    sessions_mutex: std.Thread.Mutex = .{},
+    sessions_mutex: std.Io.Mutex = std.Io.Mutex.init,
 
     // SSE event ID counter (GAP-009)
     sse_event_id: std.atomic.Value(u64) = std.atomic.Value(u64).init(1),
@@ -1378,7 +1396,7 @@ pub const Server = struct {
 
     // Cancellation and timeout tracking (GAP-024, GAP-005)
     active_requests: std.AutoHashMapUnmanaged(i64, RequestInfo) = .{},
-    requests_mutex: std.Thread.Mutex = .{},
+    requests_mutex: std.Io.Mutex = std.Io.Mutex.init,
 
     // Rate limiting (GAP-029)
     rate_limit_tokens: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
@@ -1386,40 +1404,40 @@ pub const Server = struct {
 
     // Tasks (GAP-035-040)
     tasks: std.StringHashMapUnmanaged(Task) = .{},
-    tasks_mutex: std.Thread.Mutex = .{},
+    tasks_mutex: std.Io.Mutex = std.Io.Mutex.init,
     task_id_counter: std.atomic.Value(u64) = std.atomic.Value(u64).init(1),
 
     // OAuth 2.1 (GAP-053-055)
     oauth_clients: std.StringHashMapUnmanaged(OAuthClient) = .{},
     oauth_tokens: std.StringHashMapUnmanaged(OAuthToken) = .{},
-    oauth_mutex: std.Thread.Mutex = .{},
+    oauth_mutex: std.Io.Mutex = std.Io.Mutex.init,
     oauth_client_metadata_cache: std.StringHashMapUnmanaged(CachedClientMetadata) = .{},
 
     // Worker pool
     workers: []std.Thread = &.{},
-    work_queue: std.ArrayListUnmanaged(WorkItem) = .{},
+    work_queue: std.ArrayListUnmanaged(WorkItem) = .empty,
     shutdown: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     // Stdio (with buffered I/O - Zig 0.15 API)
-    stdin_file: ?std.fs.File = null,
-    stdout_file: ?std.fs.File = null,
+    stdin_file: ?std.Io.File = null,
+    stdout_file: ?std.Io.File = null,
 
     // Runtime-allocated I/O buffers (freed in deinit)
     stdin_buffer: ?[]u8 = null,
     stdout_buffer: ?[]u8 = null,
 
     // Buffered reader/writer wrappers (using runtime buffers)
-    stdin_reader_wrap: ?std.fs.File.Reader = null,
-    stdout_writer_wrap: ?std.fs.File.Writer = null,
+    stdin_reader_wrap: ?std.Io.File.Reader = null,
+    stdout_writer_wrap: ?std.Io.File.Writer = null,
 
     // Legacy direct access (for backward compatibility in tests using unbuffered I/O)
-    stdin_reader: ?std.fs.File.Reader = null,
-    stdout_writer: ?std.fs.File.Writer = null,
+    stdin_reader: ?std.Io.File.Reader = null,
+    stdout_writer: ?std.Io.File.Writer = null,
 
     // Barrier for testing parallelism
     barrier_waiting: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     barrier_target: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-    barrier_event: std.Thread.ResetEvent = .{},
+    barrier_event: std.Io.Event = .unset,
 
     // Default I/O buffer size (can be configured via options.stdio_buffer_size)
     const DefaultStdioBufferSize: usize = 65536;
@@ -1437,12 +1455,12 @@ pub const Server = struct {
     };
 
     const SseConnection = struct {
-        stream: std.net.Stream,
+        stream: std.Io.net.Stream,
         session_id: []const u8,
         allocator: Allocator,
 
         fn deinit(self: *SseConnection) void {
-            self.stream.close();
+            streamClose(self.stream);
             self.allocator.free(self.session_id);
             self.allocator.destroy(self);
         }
@@ -1486,7 +1504,7 @@ pub const Server = struct {
 
         // Clean up active sessions (GAP-011/012)
         {
-            var keys_to_free = std.ArrayListUnmanaged([]const u8){};
+            var keys_to_free = std.ArrayListUnmanaged([]const u8).empty;
             defer keys_to_free.deinit(self.allocator);
             var session_iter = self.active_sessions.keyIterator();
             while (session_iter.next()) |key| {
@@ -1526,21 +1544,21 @@ pub const Server = struct {
         try self.startWorkers();
 
         // Initialize stdio files using cross-platform Zig API
-        self.stdin_file = std.fs.File.stdin();
-        self.stdout_file = std.fs.File.stdout();
+        self.stdin_file = std.Io.File.stdin();
+        self.stdout_file = std.Io.File.stdout();
 
         // Allocate I/O buffers for improved performance
         const buf_size = self.options.stdio_buffer_size;
         self.stdin_buffer = try self.allocator.alloc(u8, buf_size);
         self.stdout_buffer = try self.allocator.alloc(u8, buf_size);
 
-        // Create buffered reader/writer using Zig 0.15 API
-        self.stdin_reader_wrap = self.stdin_file.?.reader(self.stdin_buffer.?);
-        self.stdout_writer_wrap = self.stdout_file.?.writer(self.stdout_buffer.?);
+        // Create buffered reader/writer using Zig 0.16 API
+        self.stdin_reader_wrap = self.stdin_file.?.reader(io(), self.stdin_buffer.?);
+        self.stdout_writer_wrap = self.stdout_file.?.writer(io(), self.stdout_buffer.?);
 
         self.session = Session.init(self.allocator, self);
 
-        var line_buf = std.ArrayListUnmanaged(u8){};
+        var line_buf = std.ArrayListUnmanaged(u8).empty;
         defer line_buf.deinit(self.allocator);
 
         while (self.state == .running) {
@@ -1581,14 +1599,14 @@ pub const Server = struct {
     pub fn serveHttp(self: *Server) anyerror!u16 {
         try self.startWorkers();
 
-        const address = std.net.Address.parseIp4(self.options.http_bind, self.options.http_port) catch
+        var address = std.Io.net.IpAddress.parseIp4(self.options.http_bind, self.options.http_port) catch
             return error.InvalidAddress;
 
-        self.http_listener = try address.listen(.{
+        self.http_listener = try std.Io.net.IpAddress.listen(&address, io(), .{
             .reuse_address = true,
         });
 
-        const actual_port = self.http_listener.?.listen_address.getPort();
+        const actual_port = self.http_listener.?.socket.address.getPort();
 
         self.state = .running;
         self.http_thread = try std.Thread.spawn(.{}, httpServerThread, .{self});
@@ -1612,12 +1630,11 @@ pub const Server = struct {
 
     /// Notify clients that a subscribed resource was updated (GAP-017)
     pub fn notifyResourceUpdated(self: *Server, uri: []const u8) !void {
-        var buf = std.ArrayListUnmanaged(u8){};
+        var buf = std.ArrayListUnmanaged(u8).empty;
         errdefer buf.deinit(self.allocator);
-        const writer = buf.writer(self.allocator);
-        try writer.writeAll("{\"uri\":\"");
-        try writer.writeAll(uri);
-        try writer.writeAll("\"}");
+        try buf.appendSlice(self.allocator, "{\"uri\":\"");
+        try buf.appendSlice(self.allocator, uri);
+        try buf.appendSlice(self.allocator, "\"}");
         const params = try buf.toOwnedSlice(self.allocator);
         defer self.allocator.free(params);
         try self.sendNotification("notifications/resources/updated", params);
@@ -1630,16 +1647,15 @@ pub const Server = struct {
 
     /// Emit a log message to connected clients (GAP-020)
     pub fn emitLog(self: *Server, level: []const u8, logger: []const u8, message: []const u8) !void {
-        var buf = std.ArrayListUnmanaged(u8){};
+        var buf = std.ArrayListUnmanaged(u8).empty;
         errdefer buf.deinit(self.allocator);
-        const writer = buf.writer(self.allocator);
-        try writer.writeAll("{\"level\":\"");
-        try writer.writeAll(level);
-        try writer.writeAll("\",\"logger\":\"");
-        try writer.writeAll(logger);
-        try writer.writeAll("\",\"data\":{\"message\":\"");
-        try writer.writeAll(message);
-        try writer.writeAll("\"}}");
+        try buf.appendSlice(self.allocator, "{\"level\":\"");
+        try buf.appendSlice(self.allocator, level);
+        try buf.appendSlice(self.allocator, "\",\"logger\":\"");
+        try buf.appendSlice(self.allocator, logger);
+        try buf.appendSlice(self.allocator, "\",\"data\":{\"message\":\"");
+        try buf.appendSlice(self.allocator, message);
+        try buf.appendSlice(self.allocator, "\"}}");
         const params = try buf.toOwnedSlice(self.allocator);
         defer self.allocator.free(params);
         try self.sendNotification("notifications/message", params);
@@ -1673,66 +1689,65 @@ pub const Server = struct {
             return error.SamplingContextNotSupported;
         }
 
-        var buf = std.ArrayListUnmanaged(u8){};
+        var buf = std.ArrayListUnmanaged(u8).empty;
         errdefer buf.deinit(self.allocator);
-        const writer = buf.writer(self.allocator);
 
-        try writer.writeAll("{\"messages\":");
-        try writer.writeAll(req.messages_json);
-        try writer.writeAll(",\"maxTokens\":");
-        try std.fmt.format(writer, "{d}", .{req.max_tokens});
+        try buf.appendSlice(self.allocator, "{\"messages\":");
+        try buf.appendSlice(self.allocator, req.messages_json);
+        try buf.appendSlice(self.allocator, ",\"maxTokens\":");
+        try buf.print(self.allocator, "{d}", .{req.max_tokens});
 
         // Optional parameters
         if (req.system_prompt) |sp| {
-            try writer.writeAll(",\"systemPrompt\":\"");
-            try self.writeJsonEscapedString(writer, sp);
-            try writer.writeByte('"');
+            try buf.appendSlice(self.allocator, ",\"systemPrompt\":\"");
+            try self.writeJsonEscapedString(&buf, sp);
+            try buf.append(self.allocator, '"');
         }
 
         if (req.temperature) |temp| {
-            try writer.writeAll(",\"temperature\":");
-            try std.fmt.format(writer, "{d}", .{temp});
+            try buf.appendSlice(self.allocator, ",\"temperature\":");
+            try buf.print(self.allocator, "{d}", .{temp});
         }
 
         if (req.stop_sequences) |seqs| {
-            try writer.writeAll(",\"stopSequences\":[");
+            try buf.appendSlice(self.allocator, ",\"stopSequences\":[");
             for (seqs, 0..) |seq, i| {
-                if (i > 0) try writer.writeByte(',');
-                try writer.writeByte('"');
-                try self.writeJsonEscapedString(writer, seq);
-                try writer.writeByte('"');
+                if (i > 0) try buf.append(self.allocator, ',');
+                try buf.append(self.allocator, '"');
+                try self.writeJsonEscapedString(&buf, seq);
+                try buf.append(self.allocator, '"');
             }
-            try writer.writeByte(']');
+            try buf.append(self.allocator, ']');
         }
 
         if (req.tools_json) |tools| {
-            try writer.writeAll(",\"tools\":");
-            try writer.writeAll(tools);
+            try buf.appendSlice(self.allocator, ",\"tools\":");
+            try buf.appendSlice(self.allocator, tools);
         }
 
         if (req.tool_choice) |tc| {
-            try writer.writeAll(",\"toolChoice\":\"");
-            try writer.writeAll(tc);
-            try writer.writeByte('"');
+            try buf.appendSlice(self.allocator, ",\"toolChoice\":\"");
+            try buf.appendSlice(self.allocator, tc);
+            try buf.append(self.allocator, '"');
         }
 
         if (req.model_preferences_json) |mp| {
-            try writer.writeAll(",\"modelPreferences\":");
-            try writer.writeAll(mp);
+            try buf.appendSlice(self.allocator, ",\"modelPreferences\":");
+            try buf.appendSlice(self.allocator, mp);
         }
 
         if (req.include_context) |ic| {
-            try writer.writeAll(",\"includeContext\":\"");
-            try writer.writeAll(ic);
-            try writer.writeByte('"');
+            try buf.appendSlice(self.allocator, ",\"includeContext\":\"");
+            try buf.appendSlice(self.allocator, ic);
+            try buf.append(self.allocator, '"');
         }
 
         if (req.metadata_json) |md| {
-            try writer.writeAll(",\"metadata\":");
-            try writer.writeAll(md);
+            try buf.appendSlice(self.allocator, ",\"metadata\":");
+            try buf.appendSlice(self.allocator, md);
         }
 
-        try writer.writeByte('}');
+        try buf.append(self.allocator, '}');
         const params = try buf.toOwnedSlice(self.allocator);
         defer self.allocator.free(params);
 
@@ -1742,16 +1757,15 @@ pub const Server = struct {
         return error.NoSession;
     }
 
-    fn writeJsonEscapedString(self: *Server, writer: anytype, str: []const u8) !void {
-        _ = self;
+    fn writeJsonEscapedString(self: *Server, out: *std.ArrayListUnmanaged(u8), str: []const u8) !void {
         for (str) |c| {
             switch (c) {
-                '"' => try writer.writeAll("\\\""),
-                '\\' => try writer.writeAll("\\\\"),
-                '\n' => try writer.writeAll("\\n"),
-                '\r' => try writer.writeAll("\\r"),
-                '\t' => try writer.writeAll("\\t"),
-                else => try writer.writeByte(c),
+                '"' => try out.appendSlice(self.allocator, "\\\""),
+                '\\' => try out.appendSlice(self.allocator, "\\\\"),
+                '\n' => try out.appendSlice(self.allocator, "\\n"),
+                '\r' => try out.appendSlice(self.allocator, "\\r"),
+                '\t' => try out.appendSlice(self.allocator, "\\t"),
+                else => try out.append(self.allocator, c),
             }
         }
     }
@@ -1790,38 +1804,37 @@ pub const Server = struct {
             return error.ElicitationNotSupported;
         }
 
-        var buf = std.ArrayListUnmanaged(u8){};
+        var buf = std.ArrayListUnmanaged(u8).empty;
         errdefer buf.deinit(self.allocator);
-        const writer = buf.writer(self.allocator);
 
-        try writer.writeAll("{\"mode\":\"");
-        try writer.writeAll(@tagName(mode));
-        try writer.writeAll("\",\"message\":\"");
+        try buf.appendSlice(self.allocator, "{\"mode\":\"");
+        try buf.appendSlice(self.allocator, @tagName(mode));
+        try buf.appendSlice(self.allocator, "\",\"message\":\"");
         // Escape message for JSON
         for (message) |c| {
             switch (c) {
-                '"' => try writer.writeAll("\\\""),
-                '\\' => try writer.writeAll("\\\\"),
-                '\n' => try writer.writeAll("\\n"),
-                '\r' => try writer.writeAll("\\r"),
-                '\t' => try writer.writeAll("\\t"),
-                else => try writer.writeByte(c),
+                '"' => try buf.appendSlice(self.allocator, "\\\""),
+                '\\' => try buf.appendSlice(self.allocator, "\\\\"),
+                '\n' => try buf.appendSlice(self.allocator, "\\n"),
+                '\r' => try buf.appendSlice(self.allocator, "\\r"),
+                '\t' => try buf.appendSlice(self.allocator, "\\t"),
+                else => try buf.append(self.allocator, c),
             }
         }
-        try writer.writeAll("\"");
+        try buf.appendSlice(self.allocator, "\"");
 
         switch (mode) {
             .form => {
-                try writer.writeAll(",\"requestedSchema\":");
-                try writer.writeAll(schema_or_url);
+                try buf.appendSlice(self.allocator, ",\"requestedSchema\":");
+                try buf.appendSlice(self.allocator, schema_or_url);
             },
             .url => {
-                try writer.writeAll(",\"url\":\"");
-                try writer.writeAll(schema_or_url);
-                try writer.writeAll("\"");
+                try buf.appendSlice(self.allocator, ",\"url\":\"");
+                try buf.appendSlice(self.allocator, schema_or_url);
+                try buf.appendSlice(self.allocator, "\"");
             },
         }
-        try writer.writeByte('}');
+        try buf.append(self.allocator, '}');
 
         const params = try buf.toOwnedSlice(self.allocator);
         defer self.allocator.free(params);
@@ -1834,36 +1847,34 @@ pub const Server = struct {
 
     /// Send progress notification (GAP-023)
     pub fn notifyProgress(self: *Server, progress_token: []const u8, progress: u32, total: ?u32) !void {
-        var buf = std.ArrayListUnmanaged(u8){};
+        var buf = std.ArrayListUnmanaged(u8).empty;
         errdefer buf.deinit(self.allocator);
-        const writer = buf.writer(self.allocator);
-        try writer.writeAll("{\"progressToken\":\"");
-        try writer.writeAll(progress_token);
-        try writer.writeAll("\",\"progress\":");
-        try std.fmt.format(writer, "{d}", .{progress});
+        try buf.appendSlice(self.allocator, "{\"progressToken\":\"");
+        try buf.appendSlice(self.allocator, progress_token);
+        try buf.appendSlice(self.allocator, "\",\"progress\":");
+        try buf.print(self.allocator, "{d}", .{progress});
         if (total) |t| {
-            try writer.writeAll(",\"total\":");
-            try std.fmt.format(writer, "{d}", .{t});
+            try buf.appendSlice(self.allocator, ",\"total\":");
+            try buf.print(self.allocator, "{d}", .{t});
         }
-        try writer.writeByte('}');
+        try buf.append(self.allocator, '}');
         const params = try buf.toOwnedSlice(self.allocator);
         defer self.allocator.free(params);
         try self.sendNotification("notifications/progress", params);
     }
 
     fn sendNotification(self: *Server, method: []const u8, params: ?[]const u8) !void {
-        var buf = std.ArrayListUnmanaged(u8){};
+        var buf = std.ArrayListUnmanaged(u8).empty;
         errdefer buf.deinit(self.allocator);
-        const writer = buf.writer(self.allocator);
 
-        try writer.writeAll("{\"jsonrpc\":\"2.0\",\"method\":\"");
-        try writer.writeAll(method);
-        try writer.writeByte('"');
+        try buf.appendSlice(self.allocator, "{\"jsonrpc\":\"2.0\",\"method\":\"");
+        try buf.appendSlice(self.allocator, method);
+        try buf.append(self.allocator, '"');
         if (params) |p| {
-            try writer.writeAll(",\"params\":");
-            try writer.writeAll(p);
+            try buf.appendSlice(self.allocator, ",\"params\":");
+            try buf.appendSlice(self.allocator, p);
         }
-        try writer.writeByte('}');
+        try buf.append(self.allocator, '}');
 
         const notification = try buf.toOwnedSlice(self.allocator);
         defer self.allocator.free(notification);
@@ -1876,10 +1887,10 @@ pub const Server = struct {
 
         // Wake up accept() by making a dummy connection
         if (self.http_listener) |listener| {
-            const port = listener.listen_address.getPort();
-            const addr = std.net.Address.parseIp4("127.0.0.1", port) catch unreachable;
-            if (std.net.tcpConnectToAddress(addr)) |conn| {
-                conn.close();
+            const port = listener.socket.address.getPort();
+            var addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", port) catch unreachable;
+            if (std.Io.net.IpAddress.connect(&addr, io(), .{ .mode = .stream })) |conn| {
+                streamClose(conn);
             } else |_| {}
         }
 
@@ -1891,7 +1902,7 @@ pub const Server = struct {
 
         // Now safe to close listener
         if (self.http_listener) |*listener| {
-            listener.deinit();
+            listener.deinit(io());
             self.http_listener = null;
         }
 
@@ -1909,8 +1920,8 @@ pub const Server = struct {
         while (!self.shutdown.load(.acquire)) {
             var item: ?WorkItem = null;
             {
-                self.sse_mutex.lock();
-                defer self.sse_mutex.unlock();
+                self.sse_mutex.lockUncancelable(io());
+                defer self.sse_mutex.unlock(io());
                 if (self.work_queue.items.len > 0) {
                     item = self.work_queue.orderedRemove(0);
                 }
@@ -1918,26 +1929,27 @@ pub const Server = struct {
             if (item) |work| {
                 _ = self.processMessage(work.request_data) catch {};
             } else {
-                std.Thread.sleep(1 * std.time.ns_per_ms);
+                io().sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
             }
         }
     }
 
     fn httpServerThread(self: *Server) void {
         while (self.state == .running) {
-            const conn = self.http_listener.?.accept() catch |err| {
+            var listener = self.http_listener orelse break;
+            const conn = listener.accept(io()) catch |err| {
                 if (err == error.ConnectionAborted) continue;
                 break;
             };
-            self.handleHttpConnection(conn.stream) catch {};
+            self.handleHttpConnection(conn) catch {};
         }
     }
 
-    fn handleHttpConnection(self: *Server, stream: std.net.Stream) !void {
-        defer stream.close();
+    fn handleHttpConnection(self: *Server, stream: std.Io.net.Stream) !void {
+        defer streamClose(stream);
 
         var buf: [8192]u8 = undefined;
-        const n = try stream.read(&buf);
+        const n = streamRead(stream, &buf) catch return;
         if (n == 0) return;
 
         const request_bytes = buf[0..n];
@@ -2090,16 +2102,16 @@ pub const Server = struct {
         }
     }
 
-    fn handleSseConnection(self: *Server, stream: std.net.Stream, session_id: ?[]const u8, last_event_id: ?u64) !void {
+    fn handleSseConnection(self: *Server, stream: std.Io.net.Stream, session_id: ?[]const u8, last_event_id: ?u64) !void {
         // Send SSE headers
         const headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n";
-        try stream.writeAll(headers);
+        try streamWriteAll(stream, headers);
 
         // Send retry field (GAP-060) to hint reconnection delay to clients
         if (self.options.sse_retry_ms > 0) {
             var retry_buf: [32]u8 = undefined;
             const retry_msg = std.fmt.bufPrint(&retry_buf, "retry: {d}\n\n", .{self.options.sse_retry_ms}) catch "retry: 3000\n\n";
-            stream.writeAll(retry_msg) catch {};
+            streamWriteAll(stream, retry_msg) catch {};
         }
 
         // GAP-059: Replay missed events if Last-Event-ID was provided
@@ -2110,9 +2122,9 @@ pub const Server = struct {
                 // Replay the event with its original ID
                 var msg_buf: [128]u8 = undefined;
                 const header = std.fmt.bufPrint(&msg_buf, "id: {d}\ndata: ", .{event.id}) catch continue;
-                stream.writeAll(header) catch continue;
-                stream.writeAll(event.data) catch continue;
-                stream.writeAll("\n\n") catch continue;
+                streamWriteAll(stream, header) catch continue;
+                streamWriteAll(stream, event.data) catch continue;
+                streamWriteAll(stream, "\n\n") catch continue;
             }
         }
 
@@ -2124,9 +2136,9 @@ pub const Server = struct {
             .allocator = self.allocator,
         };
 
-        self.sse_mutex.lock();
+        self.sse_mutex.lockUncancelable(io());
         try self.sse_connections.append(self.allocator, conn);
-        self.sse_mutex.unlock();
+        self.sse_mutex.unlock(io());
     }
 
     fn checkOrigin(self: *Server, origin: ?[]const u8) bool {
@@ -2214,33 +2226,32 @@ pub const Server = struct {
     }
 
     fn getOAuthMetadata(self: *Server) ![]u8 {
-        var buf = std.ArrayListUnmanaged(u8){};
+        var buf = std.ArrayListUnmanaged(u8).empty;
         errdefer buf.deinit(self.allocator);
-        const writer = buf.writer(self.allocator);
 
         const base = self.options.http_path;
-        const port = self.http_listener.?.listen_address.getPort();
+        const port = self.http_listener.?.socket.address.getPort();
 
-        try writer.writeAll("{");
-        try std.fmt.format(writer, "\"issuer\":\"http://{s}:{d}\"", .{ self.options.http_bind, port });
-        try std.fmt.format(writer, ",\"authorization_endpoint\":\"http://{s}:{d}{s}/authorize\"", .{ self.options.http_bind, port, base });
-        try std.fmt.format(writer, ",\"token_endpoint\":\"http://{s}:{d}{s}/token\"", .{ self.options.http_bind, port, base });
+        try buf.appendSlice(self.allocator, "{");
+        try buf.print(self.allocator, "\"issuer\":\"http://{s}:{d}\"", .{ self.options.http_bind, port });
+        try buf.print(self.allocator, ",\"authorization_endpoint\":\"http://{s}:{d}{s}/authorize\"", .{ self.options.http_bind, port, base });
+        try buf.print(self.allocator, ",\"token_endpoint\":\"http://{s}:{d}{s}/token\"", .{ self.options.http_bind, port, base });
 
         // GAP-055: Include registration endpoint if DCR enabled
         if (self.options.oauth_dynamic_registration) {
-            try std.fmt.format(writer, ",\"registration_endpoint\":\"http://{s}:{d}{s}/register\"", .{ self.options.http_bind, port, base });
+            try buf.print(self.allocator, ",\"registration_endpoint\":\"http://{s}:{d}{s}/register\"", .{ self.options.http_bind, port, base });
         }
 
         // Standard OAuth 2.1 metadata
-        try writer.writeAll(",\"response_types_supported\":[\"code\"]");
-        try writer.writeAll(",\"grant_types_supported\":[\"authorization_code\",\"refresh_token\"]");
-        try writer.writeAll(",\"code_challenge_methods_supported\":[\"S256\"]"); // PKCE required
-        try writer.writeAll(",\"token_endpoint_auth_methods_supported\":[\"client_secret_basic\",\"client_secret_post\",\"none\"]");
+        try buf.appendSlice(self.allocator, ",\"response_types_supported\":[\"code\"]");
+        try buf.appendSlice(self.allocator, ",\"grant_types_supported\":[\"authorization_code\",\"refresh_token\"]");
+        try buf.appendSlice(self.allocator, ",\"code_challenge_methods_supported\":[\"S256\"]"); // PKCE required
+        try buf.appendSlice(self.allocator, ",\"token_endpoint_auth_methods_supported\":[\"client_secret_basic\",\"client_secret_post\",\"none\"]");
 
         // GAP-053: Client ID Metadata Documents support
-        try writer.writeAll(",\"client_id_metadata_document_supported\":true");
+        try buf.appendSlice(self.allocator, ",\"client_id_metadata_document_supported\":true");
 
-        try writer.writeAll("}");
+        try buf.appendSlice(self.allocator, "}");
 
         return buf.toOwnedSlice(self.allocator);
     }
@@ -2255,45 +2266,45 @@ pub const Server = struct {
         // Check if client_id is a URL (GAP-053)
         if (!std.mem.startsWith(u8, client_id, "https://")) {
             // Not a metadata document URL, check if pre-registered
-            self.oauth_mutex.lock();
-            defer self.oauth_mutex.unlock();
+            self.oauth_mutex.lockUncancelable(io());
+            defer self.oauth_mutex.unlock(io());
             return self.oauth_clients.contains(client_id);
         }
 
         // Check cache first
-        self.oauth_mutex.lock();
+        self.oauth_mutex.lockUncancelable(io());
         if (self.oauth_client_metadata_cache.get(client_id)) |cached| {
-            const now = std.time.milliTimestamp();
+            const now = std.Io.Timestamp.now(io(), .real).toMilliseconds();
             const cache_ttl: i64 = @intCast(self.options.oauth_client_metadata_cache_ms);
             if (now - cached.fetched_at < cache_ttl) {
-                self.oauth_mutex.unlock();
+                self.oauth_mutex.unlock(io());
                 return true; // Valid cached metadata
             }
         }
-        self.oauth_mutex.unlock();
+        self.oauth_mutex.unlock(io());
 
         // In a real implementation, fetch metadata from URL via HTTPS
         // For now, we validate the URL format and accept it
         // Note: Production should use std.http.Client to fetch metadata
 
         const metadata = CachedClientMetadata{
-            .fetched_at = std.time.milliTimestamp(),
+            .fetched_at = std.Io.Timestamp.now(io(), .real).toMilliseconds(),
         };
 
-        self.oauth_mutex.lock();
-        defer self.oauth_mutex.unlock();
+        self.oauth_mutex.lockUncancelable(io());
+        defer self.oauth_mutex.unlock(io());
         try self.oauth_client_metadata_cache.put(self.allocator, client_id, metadata);
         return true;
     }
 
     /// GAP-054: Validate token has correct resource indicator (RFC 8707)
     pub fn validateTokenResource(self: *Server, token: []const u8) !bool {
-        self.oauth_mutex.lock();
-        defer self.oauth_mutex.unlock();
+        self.oauth_mutex.lockUncancelable(io());
+        defer self.oauth_mutex.unlock(io());
 
         if (self.oauth_tokens.get(token)) |token_info| {
             // Check expiration
-            const now = std.time.milliTimestamp();
+            const now = std.Io.Timestamp.now(io(), .real).toMilliseconds();
             if (now > token_info.expires_at) {
                 return false; // Token expired
             }
@@ -2340,8 +2351,8 @@ pub const Server = struct {
         // Generate client credentials
         var client_id_bytes: [16]u8 = undefined;
         var client_secret_bytes: [32]u8 = undefined;
-        std.crypto.random.bytes(&client_id_bytes);
-        std.crypto.random.bytes(&client_secret_bytes);
+        io().random(&client_id_bytes);
+        io().random(&client_secret_bytes);
 
         var client_id_hex: [32]u8 = undefined;
         var client_secret_hex: [64]u8 = undefined;
@@ -2356,29 +2367,28 @@ pub const Server = struct {
             .client_id = client_id,
             .client_secret = client_secret,
             .client_name = if (client_name) |n| try self.allocator.dupe(u8, n) else null,
-            .registered_at = std.time.milliTimestamp(),
+            .registered_at = std.Io.Timestamp.now(io(), .real).toMilliseconds(),
         };
 
-        self.oauth_mutex.lock();
-        defer self.oauth_mutex.unlock();
+        self.oauth_mutex.lockUncancelable(io());
+        defer self.oauth_mutex.unlock(io());
         try self.oauth_clients.put(self.allocator, client_id, client);
 
         // Build response
-        var buf = std.ArrayListUnmanaged(u8){};
-        const writer = buf.writer(self.allocator);
-        try writer.writeAll("{\"client_id\":\"");
-        try writer.writeAll(client_id);
-        try writer.writeAll("\",\"client_secret\":\"");
-        try writer.writeAll(client_secret);
-        try writer.writeAll("\",\"client_id_issued_at\":");
-        try std.fmt.format(writer, "{d}", .{@divTrunc(client.registered_at, 1000)});
-        try writer.writeAll(",\"client_secret_expires_at\":0"); // Never expires
+        var buf = std.ArrayListUnmanaged(u8).empty;
+        try buf.appendSlice(self.allocator, "{\"client_id\":\"");
+        try buf.appendSlice(self.allocator, client_id);
+        try buf.appendSlice(self.allocator, "\",\"client_secret\":\"");
+        try buf.appendSlice(self.allocator, client_secret);
+        try buf.appendSlice(self.allocator, "\",\"client_id_issued_at\":");
+        try buf.print(self.allocator, "{d}", .{@divTrunc(client.registered_at, 1000)});
+        try buf.appendSlice(self.allocator, ",\"client_secret_expires_at\":0"); // Never expires
         if (client_name) |n| {
-            try writer.writeAll(",\"client_name\":\"");
-            try writer.writeAll(n);
-            try writer.writeAll("\"");
+            try buf.appendSlice(self.allocator, ",\"client_name\":\"");
+            try buf.appendSlice(self.allocator, n);
+            try buf.appendSlice(self.allocator, "\"");
         }
-        try writer.writeAll("}");
+        try buf.appendSlice(self.allocator, "}");
 
         return buf.toOwnedSlice(self.allocator);
     }
@@ -2392,12 +2402,12 @@ pub const Server = struct {
 
         // Generate token
         var token_bytes: [32]u8 = undefined;
-        std.crypto.random.bytes(&token_bytes);
+        io().random(&token_bytes);
         var token_hex: [64]u8 = undefined;
         _ = std.fmt.bufPrint(&token_hex, "{x:0>64}", .{std.mem.readInt(u256, &token_bytes, .big)}) catch unreachable;
 
         const access_token = try self.allocator.dupe(u8, &token_hex);
-        const now = std.time.milliTimestamp();
+        const now = std.Io.Timestamp.now(io(), .real).toMilliseconds();
 
         const token_info = OAuthToken{
             .access_token = access_token,
@@ -2407,22 +2417,21 @@ pub const Server = struct {
             .scope = if (scope) |s| try self.allocator.dupe(u8, s) else null,
         };
 
-        self.oauth_mutex.lock();
-        defer self.oauth_mutex.unlock();
+        self.oauth_mutex.lockUncancelable(io());
+        defer self.oauth_mutex.unlock(io());
         try self.oauth_tokens.put(self.allocator, access_token, token_info);
 
         // Build response
-        var buf = std.ArrayListUnmanaged(u8){};
-        const writer = buf.writer(self.allocator);
-        try writer.writeAll("{\"access_token\":\"");
-        try writer.writeAll(access_token);
-        try writer.writeAll("\",\"token_type\":\"Bearer\",\"expires_in\":3600");
+        var buf = std.ArrayListUnmanaged(u8).empty;
+        try buf.appendSlice(self.allocator, "{\"access_token\":\"");
+        try buf.appendSlice(self.allocator, access_token);
+        try buf.appendSlice(self.allocator, "\",\"token_type\":\"Bearer\",\"expires_in\":3600");
         if (scope) |s| {
-            try writer.writeAll(",\"scope\":\"");
-            try writer.writeAll(s);
-            try writer.writeAll("\"");
+            try buf.appendSlice(self.allocator, ",\"scope\":\"");
+            try buf.appendSlice(self.allocator, s);
+            try buf.appendSlice(self.allocator, "\"");
         }
-        try writer.writeAll("}");
+        try buf.appendSlice(self.allocator, "}");
 
         return buf.toOwnedSlice(self.allocator);
     }
@@ -2430,7 +2439,7 @@ pub const Server = struct {
     fn generateSessionId(self: *Server) ![]const u8 {
         // Generate cryptographically secure session ID (GAP-007)
         var random_bytes: [16]u8 = undefined;
-        std.crypto.random.bytes(&random_bytes);
+        io().random(&random_bytes);
 
         // Convert to hex string (32 chars)
         var hex_buf: [32]u8 = undefined;
@@ -2439,8 +2448,8 @@ pub const Server = struct {
         const session_id = try self.allocator.dupe(u8, &hex_buf);
 
         // Register the session (GAP-011)
-        self.sessions_mutex.lock();
-        defer self.sessions_mutex.unlock();
+        self.sessions_mutex.lockUncancelable(io());
+        defer self.sessions_mutex.unlock(io());
         self.active_sessions.put(self.allocator, session_id, {}) catch {};
 
         return session_id;
@@ -2448,8 +2457,8 @@ pub const Server = struct {
 
     /// Invalidate a session (GAP-008)
     fn invalidateSession(self: *Server, session_id: []const u8) void {
-        self.sessions_mutex.lock();
-        defer self.sessions_mutex.unlock();
+        self.sessions_mutex.lockUncancelable(io());
+        defer self.sessions_mutex.unlock(io());
 
         // Remove from active sessions
         if (self.active_sessions.fetchRemove(session_id)) |entry| {
@@ -2457,8 +2466,8 @@ pub const Server = struct {
         }
 
         // Close any SSE connections for this session
-        self.sse_mutex.lock();
-        defer self.sse_mutex.unlock();
+        self.sse_mutex.lockUncancelable(io());
+        defer self.sse_mutex.unlock(io());
 
         var i: usize = 0;
         while (i < self.sse_connections.items.len) {
@@ -2476,8 +2485,8 @@ pub const Server = struct {
     fn isSessionValid(self: *Server, session_id: ?[]const u8) bool {
         if (session_id == null) return true; // No session header = OK (first request)
 
-        self.sessions_mutex.lock();
-        defer self.sessions_mutex.unlock();
+        self.sessions_mutex.lockUncancelable(io());
+        defer self.sessions_mutex.unlock(io());
         return self.active_sessions.contains(session_id.?);
     }
 
@@ -2485,7 +2494,7 @@ pub const Server = struct {
     fn checkRateLimit(self: *Server) bool {
         if (self.options.rate_limit_requests_per_second == 0) return true; // Unlimited
 
-        const now = std.time.milliTimestamp();
+        const now = std.Io.Timestamp.now(io(), .real).toMilliseconds();
         const elapsed_ms = now - self.rate_limit_last_refill;
 
         // Refill tokens based on elapsed time
@@ -2535,8 +2544,8 @@ pub const Server = struct {
 
     /// Cancel a request by ID (GAP-024)
     fn cancelRequest(self: *Server, request_id: i64) void {
-        self.requests_mutex.lock();
-        defer self.requests_mutex.unlock();
+        self.requests_mutex.lockUncancelable(io());
+        defer self.requests_mutex.unlock(io());
 
         if (self.active_requests.get(request_id)) |info| {
             info.token.cancel();
@@ -2545,18 +2554,18 @@ pub const Server = struct {
 
     /// Register a request for cancellation/timeout tracking (GAP-024, GAP-005)
     fn registerRequest(self: *Server, request_id: i64, token: *CancelToken) void {
-        self.requests_mutex.lock();
-        defer self.requests_mutex.unlock();
+        self.requests_mutex.lockUncancelable(io());
+        defer self.requests_mutex.unlock(io());
         self.active_requests.put(self.allocator, request_id, .{
             .token = token,
-            .start_time = std.time.milliTimestamp(),
+            .start_time = std.Io.Timestamp.now(io(), .real).toMilliseconds(),
         }) catch {};
     }
 
     /// Unregister a request after completion (GAP-024)
     fn unregisterRequest(self: *Server, request_id: i64) void {
-        self.requests_mutex.lock();
-        defer self.requests_mutex.unlock();
+        self.requests_mutex.lockUncancelable(io());
+        defer self.requests_mutex.unlock(io());
         _ = self.active_requests.remove(request_id);
     }
 
@@ -2564,10 +2573,10 @@ pub const Server = struct {
     pub fn checkRequestTimeouts(self: *Server) void {
         if (self.options.request_timeout_ms == 0) return; // Timeouts disabled
 
-        self.requests_mutex.lock();
-        defer self.requests_mutex.unlock();
+        self.requests_mutex.lockUncancelable(io());
+        defer self.requests_mutex.unlock(io());
 
-        const now = std.time.milliTimestamp();
+        const now = std.Io.Timestamp.now(io(), .real).toMilliseconds();
         const timeout_ms: i64 = @intCast(self.options.request_timeout_ms);
 
         var iter = self.active_requests.iterator();
@@ -2578,42 +2587,40 @@ pub const Server = struct {
         }
     }
 
-    fn sendHttpResponse(self: *Server, stream: std.net.Stream, status: u16, status_text: []const u8, body: ?[]const u8) !void {
+    fn sendHttpResponse(self: *Server, stream: std.Io.net.Stream, status: u16, status_text: []const u8, body: ?[]const u8) !void {
         _ = self;
         var buf: [4096]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&buf);
-        const writer = fbs.writer();
+        var fbs: std.Io.Writer = .fixed(&buf);
 
-        try std.fmt.format(writer, "HTTP/1.1 {d} {s}\r\n", .{ status, status_text });
-        try writer.writeAll("Content-Type: application/json\r\n");
+        try fbs.print("HTTP/1.1 {d} {s}\r\n", .{ status, status_text });
+        try fbs.writeAll("Content-Type: application/json\r\n");
         // GAP-034: MCP-Protocol-Version header
-        try std.fmt.format(writer, "MCP-Protocol-Version: {s}\r\n", .{ProtocolVersion});
+        try fbs.print("MCP-Protocol-Version: {s}\r\n", .{ProtocolVersion});
 
         if (body) |b| {
-            try std.fmt.format(writer, "Content-Length: {d}\r\n", .{b.len});
-            try writer.writeAll("\r\n");
-            try stream.writeAll(fbs.getWritten());
-            try stream.writeAll(b);
+            try fbs.print("Content-Length: {d}\r\n", .{b.len});
+            try fbs.writeAll("\r\n");
+            try streamWriteAll(stream, fbs.buffered());
+            try streamWriteAll(stream, b);
         } else {
-            try writer.writeAll("Content-Length: 0\r\n\r\n");
-            try stream.writeAll(fbs.getWritten());
+            try fbs.writeAll("Content-Length: 0\r\n\r\n");
+            try streamWriteAll(stream, fbs.buffered());
         }
     }
 
-    fn sendHttpResponseWithSession(self: *Server, stream: std.net.Stream, status: u16, status_text: []const u8, body: []const u8, session_id: []const u8) !void {
+    fn sendHttpResponseWithSession(self: *Server, stream: std.Io.net.Stream, status: u16, status_text: []const u8, body: []const u8, session_id: []const u8) !void {
         _ = self;
         var buf: [4096]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&buf);
-        const writer = fbs.writer();
+        var fbs: std.Io.Writer = .fixed(&buf);
 
-        try std.fmt.format(writer, "HTTP/1.1 {d} {s}\r\n", .{ status, status_text });
-        try writer.writeAll("Content-Type: application/json\r\n");
-        try std.fmt.format(writer, "Mcp-Session-Id: {s}\r\n", .{session_id});
+        try fbs.print("HTTP/1.1 {d} {s}\r\n", .{ status, status_text });
+        try fbs.writeAll("Content-Type: application/json\r\n");
+        try fbs.print("Mcp-Session-Id: {s}\r\n", .{session_id});
         // GAP-034: MCP-Protocol-Version header
-        try std.fmt.format(writer, "MCP-Protocol-Version: {s}\r\n", .{ProtocolVersion});
-        try std.fmt.format(writer, "Content-Length: {d}\r\n\r\n", .{body.len});
-        try stream.writeAll(fbs.getWritten());
-        try stream.writeAll(body);
+        try fbs.print("MCP-Protocol-Version: {s}\r\n", .{ProtocolVersion});
+        try fbs.print("Content-Length: {d}\r\n\r\n", .{body.len});
+        try streamWriteAll(stream, fbs.buffered());
+        try streamWriteAll(stream, body);
     }
 
     pub fn processMessage(self: *Server, data: []const u8) !?[]const u8 {
@@ -2704,7 +2711,7 @@ pub const Server = struct {
         }
 
         // Collect responses in order
-        var responses = std.ArrayListUnmanaged([]const u8){};
+        var responses = std.ArrayListUnmanaged([]const u8).empty;
         defer {
             for (responses.items) |r| self.allocator.free(r);
             responses.deinit(self.allocator);
@@ -2724,16 +2731,15 @@ pub const Server = struct {
         }
 
         // Build batch response
-        var buf = std.ArrayListUnmanaged(u8){};
+        var buf = std.ArrayListUnmanaged(u8).empty;
         errdefer buf.deinit(self.allocator);
-        const writer = buf.writer(self.allocator);
 
-        try writer.writeByte('[');
+        try buf.append(self.allocator, '[');
         for (responses.items, 0..) |resp, i| {
-            if (i > 0) try writer.writeByte(',');
-            try writer.writeAll(resp);
+            if (i > 0) try buf.append(self.allocator, ',');
+            try buf.appendSlice(self.allocator, resp);
         }
-        try writer.writeByte(']');
+        try buf.append(self.allocator, ']');
 
         return @as(?[]const u8, try buf.toOwnedSlice(self.allocator));
     }
@@ -3029,45 +3035,44 @@ pub const Server = struct {
         }
 
         // Build and cache the response
-        var buf = std.ArrayListUnmanaged(u8){};
+        var buf = std.ArrayListUnmanaged(u8).empty;
         errdefer buf.deinit(self.allocator);
-        const writer = buf.writer(self.allocator);
 
-        try writer.writeAll("{\"protocolVersion\":\"");
-        try writer.writeAll(ProtocolVersion);
-        try writer.writeAll("\",\"capabilities\":{\"tools\":{\"listChanged\":true},\"resources\":{\"subscribe\":true,\"listChanged\":true},\"prompts\":{\"listChanged\":true},\"logging\":{},\"completions\":{}");
+        try buf.appendSlice(self.allocator, "{\"protocolVersion\":\"");
+        try buf.appendSlice(self.allocator, ProtocolVersion);
+        try buf.appendSlice(self.allocator, "\",\"capabilities\":{\"tools\":{\"listChanged\":true},\"resources\":{\"subscribe\":true,\"listChanged\":true},\"prompts\":{\"listChanged\":true},\"logging\":{},\"completions\":{}");
         // GAP-035: Add tasks capability if enabled
         if (self.options.tasks_enabled) {
-            try writer.writeAll(",\"tasks\":{\"list\":true,\"cancel\":true,\"requests\":{\"tools\":{\"call\":true}}}");
+            try buf.appendSlice(self.allocator, ",\"tasks\":{\"list\":true,\"cancel\":true,\"requests\":{\"tools\":{\"call\":true}}}");
         }
-        try writer.writeAll("},\"serverInfo\":{\"name\":\"");
-        try writer.writeAll(self.options.name);
-        try writer.writeAll("\",\"version\":\"");
-        try writer.writeAll(self.options.version);
-        try writer.writeAll("\"");
+        try buf.appendSlice(self.allocator, "},\"serverInfo\":{\"name\":\"");
+        try buf.appendSlice(self.allocator, self.options.name);
+        try buf.appendSlice(self.allocator, "\",\"version\":\"");
+        try buf.appendSlice(self.allocator, self.options.version);
+        try buf.appendSlice(self.allocator, "\"");
         if (self.options.instructions) |inst| {
-            try writer.writeAll(",\"instructions\":\"");
-            try writer.writeAll(inst);
-            try writer.writeAll("\"");
+            try buf.appendSlice(self.allocator, ",\"instructions\":\"");
+            try buf.appendSlice(self.allocator, inst);
+            try buf.appendSlice(self.allocator, "\"");
         }
         // GAP-050: description field
         if (self.options.description) |desc| {
-            try writer.writeAll(",\"description\":\"");
-            try writer.writeAll(desc);
-            try writer.writeAll("\"");
+            try buf.appendSlice(self.allocator, ",\"description\":\"");
+            try buf.appendSlice(self.allocator, desc);
+            try buf.appendSlice(self.allocator, "\"");
         }
         // GAP-052: website field
         if (self.options.website) |site| {
-            try writer.writeAll(",\"website\":\"");
-            try writer.writeAll(site);
-            try writer.writeAll("\"");
+            try buf.appendSlice(self.allocator, ",\"website\":\"");
+            try buf.appendSlice(self.allocator, site);
+            try buf.appendSlice(self.allocator, "\"");
         }
         // GAP-051: icons field (expects JSON array)
         if (self.options.icons) |ic| {
-            try writer.writeAll(",\"icons\":");
-            try writer.writeAll(ic);
+            try buf.appendSlice(self.allocator, ",\"icons\":");
+            try buf.appendSlice(self.allocator, ic);
         }
-        try writer.writeAll("}}");
+        try buf.appendSlice(self.allocator, "}}");
 
         self.cached_init_response = try buf.toOwnedSlice(self.allocator);
         return self.cached_init_response.?;
@@ -3086,7 +3091,7 @@ pub const Server = struct {
     /// Create a new task for async request processing (GAP-040)
     pub fn createTask(self: *Server, method: []const u8, ttl_ms: ?u32) !*Task {
         const task_id = try self.generateTaskId();
-        const now = std.time.milliTimestamp();
+        const now = std.Io.Timestamp.now(io(), .real).toMilliseconds();
 
         const task = Task{
             .id = task_id,
@@ -3099,8 +3104,8 @@ pub const Server = struct {
             .method = try self.allocator.dupe(u8, method),
         };
 
-        self.tasks_mutex.lock();
-        defer self.tasks_mutex.unlock();
+        self.tasks_mutex.lockUncancelable(io());
+        defer self.tasks_mutex.unlock(io());
 
         try self.tasks.put(self.allocator, task_id, task);
         return self.tasks.getPtr(task_id).?;
@@ -3108,19 +3113,19 @@ pub const Server = struct {
 
     /// Get task by ID
     pub fn getTask(self: *Server, task_id: []const u8) ?*Task {
-        self.tasks_mutex.lock();
-        defer self.tasks_mutex.unlock();
+        self.tasks_mutex.lockUncancelable(io());
+        defer self.tasks_mutex.unlock(io());
         return self.tasks.getPtr(task_id);
     }
 
     /// Update task status
     pub fn updateTaskStatus(self: *Server, task_id: []const u8, status: TaskState, result: ?[]const u8) void {
-        self.tasks_mutex.lock();
-        defer self.tasks_mutex.unlock();
+        self.tasks_mutex.lockUncancelable(io());
+        defer self.tasks_mutex.unlock(io());
 
         if (self.tasks.getPtr(task_id)) |task| {
             task.status = status;
-            task.last_updated = std.time.milliTimestamp();
+            task.last_updated = std.Io.Timestamp.now(io(), .real).toMilliseconds();
             if (result) |r| {
                 task.result = self.allocator.dupe(u8, r) catch null;
             }
@@ -3129,8 +3134,8 @@ pub const Server = struct {
 
     /// GAP-036: Handle tasks/get
     fn handleTasksGet(self: *Server, task_id: []const u8) !?[]const u8 {
-        self.tasks_mutex.lock();
-        defer self.tasks_mutex.unlock();
+        self.tasks_mutex.lockUncancelable(io());
+        defer self.tasks_mutex.unlock(io());
 
         if (self.tasks.getPtr(task_id)) |task| {
             return @as(?[]const u8, try task.toJson(self.allocator));
@@ -3155,8 +3160,8 @@ pub const Server = struct {
         }
         if (limit == 0) limit = 1;
 
-        self.tasks_mutex.lock();
-        defer self.tasks_mutex.unlock();
+        self.tasks_mutex.lockUncancelable(io());
+        defer self.tasks_mutex.unlock(io());
 
         const TaskEntry = struct {
             id: []const u8,
@@ -3164,7 +3169,7 @@ pub const Server = struct {
             task: *const Task,
         };
 
-        var entries = std.ArrayListUnmanaged(TaskEntry){};
+        var entries = std.ArrayListUnmanaged(TaskEntry).empty;
         defer entries.deinit(self.allocator);
 
         var iter = self.tasks.iterator();
@@ -3201,40 +3206,39 @@ pub const Server = struct {
         const end_index = @min(entries.items.len, start_index + limit);
         const has_more = end_index < entries.items.len;
 
-        var buf = std.ArrayListUnmanaged(u8){};
-        const writer = buf.writer(self.allocator);
-        try writer.writeAll("{\"tasks\":[");
+        var buf = std.ArrayListUnmanaged(u8).empty;
+        try buf.appendSlice(self.allocator, "{\"tasks\":[");
 
         var first = true;
         var idx = start_index;
         while (idx < end_index) : (idx += 1) {
             const entry = entries.items[idx];
-            if (!first) try writer.writeAll(",");
+            if (!first) try buf.appendSlice(self.allocator, ",");
             first = false;
             const task_json = try entry.task.toJson(self.allocator);
             defer self.allocator.free(task_json);
-            try writer.writeAll(task_json);
+            try buf.appendSlice(self.allocator, task_json);
         }
 
         if (has_more) {
-            try writer.writeAll("],\"nextCursor\":\"");
-            try writer.writeAll(entries.items[end_index - 1].id);
-            try writer.writeAll("\"}");
+            try buf.appendSlice(self.allocator, "],\"nextCursor\":\"");
+            try buf.appendSlice(self.allocator, entries.items[end_index - 1].id);
+            try buf.appendSlice(self.allocator, "\"}");
         } else {
-            try writer.writeAll("]}");
+            try buf.appendSlice(self.allocator, "]}");
         }
         return @as(?[]const u8, try buf.toOwnedSlice(self.allocator));
     }
 
     /// GAP-038: Handle tasks/cancel
     fn handleTasksCancel(self: *Server, task_id: []const u8) !?[]const u8 {
-        self.tasks_mutex.lock();
-        defer self.tasks_mutex.unlock();
+        self.tasks_mutex.lockUncancelable(io());
+        defer self.tasks_mutex.unlock(io());
 
         if (self.tasks.getPtr(task_id)) |task| {
             if (!task.status.isTerminal()) {
                 task.status = .cancelled;
-                task.last_updated = std.time.milliTimestamp();
+                task.last_updated = std.Io.Timestamp.now(io(), .real).toMilliseconds();
             }
             return @as(?[]const u8, try task.toJson(self.allocator));
         }
@@ -3244,13 +3248,13 @@ pub const Server = struct {
     /// GAP-039: Handle tasks/result (blocking until complete)
     fn handleTasksResult(self: *Server, task_id: []const u8) !?[]const u8 {
         // Poll until task is complete (with timeout)
-        const start = std.time.milliTimestamp();
+        const start = std.Io.Timestamp.now(io(), .real).toMilliseconds();
         const timeout_ms: i64 = 60000; // 1 minute max wait
 
         while (true) {
             {
-                self.tasks_mutex.lock();
-                defer self.tasks_mutex.unlock();
+                self.tasks_mutex.lockUncancelable(io());
+                defer self.tasks_mutex.unlock(io());
 
                 if (self.tasks.getPtr(task_id)) |task| {
                     if (task.status.isTerminal()) {
@@ -3266,12 +3270,12 @@ pub const Server = struct {
             }
 
             // Check timeout
-            if (std.time.milliTimestamp() - start > timeout_ms) {
+            if (std.Io.Timestamp.now(io(), .real).toMilliseconds() - start > timeout_ms) {
                 return error.InvalidParams; // Timeout waiting for task
             }
 
             // Sleep briefly before polling again
-            std.Thread.sleep(100 * std.time.ns_per_ms);
+            io().sleep(std.Io.Duration.fromMilliseconds(100), .awake) catch {};
         }
     }
 
@@ -3302,10 +3306,10 @@ pub const Server = struct {
 
         // If we've reached the target, signal all waiters
         if (current >= self.barrier_target.load(.acquire)) {
-            self.barrier_event.set();
+            self.barrier_event.set(io());
         } else {
             // Wait for other requests
-            self.barrier_event.wait();
+            self.barrier_event.waitUncancelable(io());
         }
 
         // Reset for next use
@@ -3366,22 +3370,21 @@ pub const Server = struct {
     }
 
     fn makeSuccessResponse(self: *Server, id: RequestId, result: ?[]const u8) ![]const u8 {
-        var buf = std.ArrayListUnmanaged(u8){};
+        var buf = std.ArrayListUnmanaged(u8).empty;
         errdefer buf.deinit(self.allocator);
-        const writer = buf.writer(self.allocator);
 
-        try writer.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
+        try buf.appendSlice(self.allocator, "{\"jsonrpc\":\"2.0\",\"id\":");
         switch (id) {
-            .int => |i| try std.fmt.format(writer, "{d}", .{i}),
+            .int => |i| try buf.print(self.allocator, "{d}", .{i}),
             .str => |s| {
-                try writer.writeByte('"');
-                try writer.writeAll(s);
-                try writer.writeByte('"');
+                try buf.append(self.allocator, '"');
+                try buf.appendSlice(self.allocator, s);
+                try buf.append(self.allocator, '"');
             },
         }
-        try writer.writeAll(",\"result\":");
-        try writer.writeAll(result orelse "null");
-        try writer.writeByte('}');
+        try buf.appendSlice(self.allocator, ",\"result\":");
+        try buf.appendSlice(self.allocator, result orelse "null");
+        try buf.append(self.allocator, '}');
 
         // Note: result is NOT freed here - handlers may return static strings
         // or allocated memory. Caller is responsible for their own allocations.
@@ -3394,33 +3397,32 @@ pub const Server = struct {
 
     /// GAP-032: Error response with optional data field
     fn makeErrorResponseWithData(self: *Server, id: ?RequestId, code: i32, message: []const u8, data: ?[]const u8) ![]const u8 {
-        var buf = std.ArrayListUnmanaged(u8){};
+        var buf = std.ArrayListUnmanaged(u8).empty;
         errdefer buf.deinit(self.allocator);
-        const writer = buf.writer(self.allocator);
 
-        try writer.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
+        try buf.appendSlice(self.allocator, "{\"jsonrpc\":\"2.0\",\"id\":");
         if (id) |req_id| {
             switch (req_id) {
-                .int => |i| try std.fmt.format(writer, "{d}", .{i}),
+                .int => |i| try buf.print(self.allocator, "{d}", .{i}),
                 .str => |s| {
-                    try writer.writeByte('"');
-                    try writer.writeAll(s);
-                    try writer.writeByte('"');
+                    try buf.append(self.allocator, '"');
+                    try buf.appendSlice(self.allocator, s);
+                    try buf.append(self.allocator, '"');
                 },
             }
         } else {
-            try writer.writeAll("null");
+            try buf.appendSlice(self.allocator, "null");
         }
-        try writer.writeAll(",\"error\":{\"code\":");
-        try std.fmt.format(writer, "{d}", .{code});
-        try writer.writeAll(",\"message\":\"");
-        try writer.writeAll(message);
-        try writer.writeByte('"');
+        try buf.appendSlice(self.allocator, ",\"error\":{\"code\":");
+        try buf.print(self.allocator, "{d}", .{code});
+        try buf.appendSlice(self.allocator, ",\"message\":\"");
+        try buf.appendSlice(self.allocator, message);
+        try buf.append(self.allocator, '"');
         if (data) |d| {
-            try writer.writeAll(",\"data\":");
-            try writer.writeAll(d);
+            try buf.appendSlice(self.allocator, ",\"data\":");
+            try buf.appendSlice(self.allocator, d);
         }
-        try writer.writeAll("}}");
+        try buf.appendSlice(self.allocator, "}}");
 
         return buf.toOwnedSlice(self.allocator);
     }
@@ -3452,8 +3454,8 @@ pub const Server = struct {
         }
 
         // Send via SSE for HTTP transport
-        self.sse_mutex.lock();
-        defer self.sse_mutex.unlock();
+        self.sse_mutex.lockUncancelable(io());
+        defer self.sse_mutex.unlock(io());
 
         // GAP-009: Include event ID for resumability
         const event_id = self.sse_event_id.fetchAdd(1, .monotonic);
@@ -3464,7 +3466,7 @@ pub const Server = struct {
         for (self.sse_connections.items) |conn| {
             const sse_msg = try std.fmt.allocPrint(self.allocator, "id: {d}\ndata: {s}\n\n", .{ event_id, data });
             defer self.allocator.free(sse_msg);
-            conn.stream.writeAll(sse_msg) catch {};
+            streamWriteAll(conn.stream, sse_msg) catch {};
         }
     }
 };

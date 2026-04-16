@@ -43,22 +43,20 @@ const Transport = enum {
 
 var next_id: i64 = 1;
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
 
-    var args = try std.process.argsWithAllocator(allocator);
-    defer args.deinit();
-    _ = args.skip(); // Skip program name
+    const argv = try init.minimal.args.toSlice(init.arena.allocator());
+    var arg_idx: usize = 1; // skip program name
 
     var config = Config{};
     var command: ?[]const u8 = null;
-    var extra_args = std.ArrayListUnmanaged([]const u8){};
+    var extra_args = std.ArrayListUnmanaged([]const u8).empty;
     defer extra_args.deinit(allocator);
 
     // Parse arguments
-    while (args.next()) |arg| {
+    while (arg_idx < argv.len) : (arg_idx += 1) {
+        const arg = argv[arg_idx];
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printUsage();
             return;
@@ -66,9 +64,11 @@ pub fn main() !void {
             config.transport = .stdio;
         } else if (std.mem.eql(u8, arg, "--http")) {
             config.transport = .http;
-            config.http_url = args.next();
+            arg_idx += 1;
+            if (arg_idx < argv.len) config.http_url = argv[arg_idx];
         } else if (std.mem.eql(u8, arg, "--command")) {
-            config.spawn_command = args.next();
+            arg_idx += 1;
+            if (arg_idx < argv.len) config.spawn_command = argv[arg_idx];
         } else if (arg[0] != '-') {
             if (command == null) {
                 command = arg;
@@ -90,10 +90,10 @@ pub fn main() !void {
     // Interactive mode
     std.debug.print("Interactive mode. Type 'help' for commands, 'quit' to exit.\n\n", .{});
 
-    const stdin_file = std.fs.File.stdin();
+    const stdin_file = std.Io.File.stdin();
     var line_buf: [4096]u8 = undefined;
     var read_buf: [256]u8 = undefined;
-    var reader = stdin_file.reader(&read_buf);
+    var reader = stdin_file.reader(init.io, &read_buf);
 
     while (true) {
         std.debug.print("> ", .{});
@@ -120,7 +120,7 @@ pub fn main() !void {
         // Parse command
         var parts = std.mem.splitScalar(u8, line, ' ');
         const cmd = parts.next() orelse continue;
-        var cmd_args = std.ArrayListUnmanaged([]const u8){};
+        var cmd_args = std.ArrayListUnmanaged([]const u8).empty;
         defer cmd_args.deinit(allocator);
         while (parts.next()) |part| {
             try cmd_args.append(allocator, part);

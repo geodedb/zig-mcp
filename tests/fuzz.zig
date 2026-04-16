@@ -73,7 +73,7 @@ pub const Fuzzer = struct {
     pub fn init(allocator: std.mem.Allocator, config: FuzzConfig) Fuzzer {
         const seed = if (config.seed == 0) blk: {
             var buf: [8]u8 = undefined;
-            std.crypto.random.bytes(&buf);
+            std.Io.Threaded.global_single_threaded.io().random(&buf);
             break :blk std.mem.readInt(u64, &buf, .little);
         } else config.seed;
 
@@ -82,7 +82,7 @@ pub const Fuzzer = struct {
             .config = config,
             .prng = std.Random.DefaultPrng.init(seed),
             .result = FuzzResult.init(allocator),
-            .corpus = .{},
+            .corpus = .empty,
         };
     }
 
@@ -106,15 +106,18 @@ pub const Fuzzer = struct {
 
     /// Load corpus from directory
     pub fn loadCorpus(self: *Fuzzer, dir_path: []const u8) !void {
-        var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
-        defer dir.close();
+        const fuzz_io = std.Io.Threaded.global_single_threaded.io();
+        var dir = std.Io.Dir.cwd().openDir(fuzz_io, dir_path, .{ .iterate = true }) catch return;
+        defer dir.close(fuzz_io);
 
         var iter = dir.iterate();
-        while (try iter.next()) |entry| {
+        while (try iter.next(fuzz_io)) |entry| {
             if (entry.kind == .file) {
-                const file = dir.openFile(entry.name, .{}) catch continue;
-                defer file.close();
-                const content = file.readToEndAlloc(self.allocator, self.config.max_input_size) catch continue;
+                const file = dir.openFile(fuzz_io, entry.name, .{}) catch continue;
+                defer file.close(fuzz_io);
+                var read_buf: [4096]u8 = undefined;
+                var rdr = file.reader(fuzz_io, &read_buf);
+                const content = rdr.interface.readAlloc(self.allocator, self.config.max_input_size) catch continue;
                 try self.corpus.append(self.allocator, content);
             }
         }
@@ -420,35 +423,37 @@ pub fn fuzzHttpHeaders(input: []const u8) void {
 // Main Entry Point
 // ============================================================================
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
 
-    var args = try std.process.argsWithAllocator(allocator);
-    defer args.deinit();
-    _ = args.skip();
+    const argv = try init.minimal.args.toSlice(init.arena.allocator());
+    var arg_idx: usize = 1; // skip program name
 
     var config = FuzzConfig{};
     var target_name: []const u8 = "json";
 
-    while (args.next()) |arg| {
+    while (arg_idx < argv.len) : (arg_idx += 1) {
+        const arg = argv[arg_idx];
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printUsage();
             return;
         } else if (std.mem.eql(u8, arg, "--corpus")) {
-            config.corpus_dir = args.next();
+            arg_idx += 1;
+            if (arg_idx < argv.len) config.corpus_dir = argv[arg_idx];
         } else if (std.mem.eql(u8, arg, "--iterations")) {
-            if (args.next()) |n| {
-                config.iterations = std.fmt.parseInt(u64, n, 10) catch 1000000;
+            arg_idx += 1;
+            if (arg_idx < argv.len) {
+                config.iterations = std.fmt.parseInt(u64, argv[arg_idx], 10) catch 1000000;
             }
         } else if (std.mem.eql(u8, arg, "--seed")) {
-            if (args.next()) |s| {
-                config.seed = std.fmt.parseInt(u64, s, 10) catch 0;
+            arg_idx += 1;
+            if (arg_idx < argv.len) {
+                config.seed = std.fmt.parseInt(u64, argv[arg_idx], 10) catch 0;
             }
         } else if (std.mem.eql(u8, arg, "--target")) {
-            if (args.next()) |t| {
-                target_name = t;
+            arg_idx += 1;
+            if (arg_idx < argv.len) {
+                target_name = argv[arg_idx];
             }
         }
     }

@@ -57,12 +57,16 @@ const tp = @import("thread_pool");
 
 const MAX_CHUNKS = 64;
 
+inline fn io() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
 var global_pool: ?tp.ThreadPool = null;
-var pool_mutex: std.Thread.Mutex = .{};
+var pool_mutex: std.Io.Mutex = std.Io.Mutex.init;
 
 pub fn getPool() *tp.ThreadPool {
-    pool_mutex.lock();
-    defer pool_mutex.unlock();
+    pool_mutex.lockUncancelable(io());
+    defer pool_mutex.unlock(io());
 
     if (global_pool == null) {
         global_pool = tp.ThreadPool.init(std.heap.page_allocator, .{}) catch
@@ -72,8 +76,8 @@ pub fn getPool() *tp.ThreadPool {
 }
 
 pub fn deinitPool() void {
-    pool_mutex.lock();
-    defer pool_mutex.unlock();
+    pool_mutex.lockUncancelable(io());
+    defer pool_mutex.unlock(io());
 
     if (global_pool) |*pool| {
         pool.deinit();

@@ -20,10 +20,10 @@ const mcp = @import("mcp");
 
 pub fn main() !void {
     // Step 1: Create an allocator
-    // The GeneralPurposeAllocator is suitable for most use cases.
+    // The DebugAllocator is suitable for most use cases.
     // For production servers handling many requests, consider using
     // ArenaAllocator for per-request allocations.
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -106,22 +106,22 @@ fn listTools(_: ?*anyopaque, cursor: ?[]const u8) anyerror![]const u8 {
     // - description: Human-readable description for the LLM
     // - inputSchema: JSON Schema describing the expected arguments
     return
-        \\{"tools":[
-        \\  {
-        \\    "name": "echo",
-        \\    "description": "Echoes back the provided message. Use this to test the server connection.",
-        \\    "inputSchema": {
-        \\      "type": "object",
-        \\      "properties": {
-        \\        "message": {
-        \\          "type": "string",
-        \\          "description": "The message to echo back"
-        \\        }
-        \\      },
-        \\      "required": ["message"]
-        \\    }
-        \\  }
-        \\]}
+    \\{"tools":[
+    \\  {
+    \\    "name": "echo",
+    \\    "description": "Echoes back the provided message. Use this to test the server connection.",
+    \\    "inputSchema": {
+    \\      "type": "object",
+    \\      "properties": {
+    \\        "message": {
+    \\          "type": "string",
+    \\          "description": "The message to echo back"
+    \\        }
+    \\      },
+    \\      "required": ["message"]
+    \\    }
+    \\  }
+    \\]}
     ;
 }
 
@@ -158,7 +158,7 @@ fn handleEcho(args_json: []const u8) ![]const u8 {
     _ = args_json;
 
     return
-        \\{"content":[{"type":"text","text":"Echo: Message received!"}]}
+    \\{"content":[{"type":"text","text":"Echo: Message received!"}]}
     ;
 }
 

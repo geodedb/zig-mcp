@@ -47,28 +47,27 @@ const Filter = enum {
     notification,
 };
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
 
-    const config = parseArgs(allocator) catch {
+    const argv = try init.minimal.args.toSlice(init.arena.allocator());
+    const config = parseArgs(argv) catch {
         printUsage();
         return;
     };
 
     // Open input source
-    var file: ?std.fs.File = null;
-    var input_file: std.fs.File = undefined;
+    var file: ?std.Io.File = null;
+    var input_file: std.Io.File = undefined;
     var read_buf: [4096]u8 = undefined;
 
     switch (config.input) {
         .stdin => {
-            input_file = std.fs.File.stdin();
+            input_file = std.Io.File.stdin();
         },
         .file => {
             if (config.file_path) |path| {
-                file = try std.fs.cwd().openFile(path, .{});
+                file = try std.Io.Dir.cwd().openFile(init.io, path, .{});
                 input_file = file.?;
             } else {
                 std.debug.print("Error: --file requires a path\n", .{});
@@ -76,9 +75,9 @@ pub fn main() !void {
             }
         },
     }
-    defer if (file) |f| f.close();
+    defer if (file) |f| f.close(init.io);
 
-    var reader = input_file.reader(&read_buf);
+    var reader = input_file.reader(init.io, &read_buf);
 
     std.debug.print("MCP Protocol Inspector\n", .{});
     std.debug.print("======================\n", .{});
@@ -272,13 +271,12 @@ fn outputCompact(num: usize, msg_type: Filter, root: json.Value) void {
     std.debug.print("\n", .{});
 }
 
-fn parseArgs(allocator: std.mem.Allocator) !Config {
+fn parseArgs(argv: []const [:0]const u8) !Config {
     var config = Config{};
-    var args = try std.process.argsWithAllocator(allocator);
-    defer args.deinit();
-    _ = args.skip();
+    var arg_idx: usize = 1; // skip program name
 
-    while (args.next()) |arg| {
+    while (arg_idx < argv.len) : (arg_idx += 1) {
+        const arg = argv[arg_idx];
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printUsage();
             std.process.exit(0);
@@ -286,9 +284,12 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
             config.input = .stdin;
         } else if (std.mem.eql(u8, arg, "--file")) {
             config.input = .file;
-            config.file_path = args.next();
+            arg_idx += 1;
+            if (arg_idx < argv.len) config.file_path = argv[arg_idx];
         } else if (std.mem.eql(u8, arg, "--format")) {
-            if (args.next()) |fmt| {
+            arg_idx += 1;
+            if (arg_idx < argv.len) {
+                const fmt = argv[arg_idx];
                 if (std.mem.eql(u8, fmt, "pretty")) {
                     config.format = .pretty;
                 } else if (std.mem.eql(u8, fmt, "json")) {
@@ -298,7 +299,9 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
                 }
             }
         } else if (std.mem.eql(u8, arg, "--filter")) {
-            if (args.next()) |f| {
+            arg_idx += 1;
+            if (arg_idx < argv.len) {
+                const f = argv[arg_idx];
                 if (std.mem.eql(u8, f, "request")) {
                     config.filter = .request;
                 } else if (std.mem.eql(u8, f, "response")) {

@@ -33,13 +33,12 @@ const Transport = enum {
     http,
 };
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
 
     // Parse command line arguments
-    const config = parseArgs(allocator) catch |err| {
+    const argv = try init.minimal.args.toSlice(init.arena.allocator());
+    const config = parseArgs(argv) catch |err| {
         std.debug.print("Error parsing arguments: {}\n", .{err});
         printUsage();
         return;
@@ -79,20 +78,18 @@ pub fn main() !void {
             // Wait for interrupt
             std.debug.print("Press Ctrl+C to stop\n", .{});
             while (true) {
-                std.Thread.sleep(std.time.ns_per_s);
+                std.Io.Threaded.global_single_threaded.io().sleep(std.Io.Duration.fromSeconds(1), .awake) catch {};
             }
         },
     }
 }
 
-fn parseArgs(allocator: std.mem.Allocator) !Config {
+fn parseArgs(argv: []const [:0]const u8) !Config {
     var config = Config{};
 
-    var args = try std.process.argsWithAllocator(allocator);
-    defer args.deinit();
-    _ = args.skip(); // Skip program name
-
-    while (args.next()) |arg| {
+    var arg_idx: usize = 1; // skip program name
+    while (arg_idx < argv.len) : (arg_idx += 1) {
+        const arg = argv[arg_idx];
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printUsage();
             std.process.exit(0);
@@ -101,20 +98,24 @@ fn parseArgs(allocator: std.mem.Allocator) !Config {
         } else if (std.mem.eql(u8, arg, "--http")) {
             config.transport = .http;
         } else if (std.mem.eql(u8, arg, "--port")) {
-            if (args.next()) |port_str| {
-                config.port = std.fmt.parseInt(u16, port_str, 10) catch 8080;
+            {
+                arg_idx += 1;
+                if (arg_idx < argv.len) config.port = std.fmt.parseInt(u16, argv[arg_idx], 10) catch 8080;
             }
         } else if (std.mem.eql(u8, arg, "--host")) {
-            if (args.next()) |host| {
-                config.host = host;
+            {
+                arg_idx += 1;
+                if (arg_idx < argv.len) config.host = argv[arg_idx];
             }
         } else if (std.mem.eql(u8, arg, "--name")) {
-            if (args.next()) |name| {
-                config.name = name;
+            {
+                arg_idx += 1;
+                if (arg_idx < argv.len) config.name = argv[arg_idx];
             }
         } else if (std.mem.eql(u8, arg, "--version")) {
-            if (args.next()) |ver| {
-                config.version = ver;
+            {
+                arg_idx += 1;
+                if (arg_idx < argv.len) config.version = argv[arg_idx];
             }
         } else if (std.mem.eql(u8, arg, "--verbose") or std.mem.eql(u8, arg, "-v")) {
             config.verbose = true;

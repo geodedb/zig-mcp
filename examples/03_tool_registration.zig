@@ -26,7 +26,7 @@ const ServerState = struct {
 
     // Example state: a key-value store
     storage: std.StringHashMap([]const u8),
-    storage_mutex: std.Thread.Mutex = .{},
+    storage_mutex: std.Io.Mutex = std.Io.Mutex.init,
 
     pub fn init(allocator: std.mem.Allocator) ServerState {
         return .{
@@ -46,7 +46,7 @@ const ServerState = struct {
 };
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -102,81 +102,81 @@ pub fn main() !void {
 fn listTools(_: ?*anyopaque, _: ?[]const u8) anyerror![]const u8 {
     // Comprehensive tool definitions with metadata
     return
-        \\{"tools":[
-        \\  {
-        \\    "name": "counter",
-        \\    "title": "Persistent Counter",
-        \\    "description": "A counter that persists across calls. Supports increment, decrement, get, and reset operations.",
-        \\    "inputSchema": {
-        \\      "type": "object",
-        \\      "properties": {
-        \\        "operation": {
-        \\          "type": "string",
-        \\          "enum": ["increment", "decrement", "get", "reset"],
-        \\          "description": "The operation to perform on the counter"
-        \\        },
-        \\        "amount": {
-        \\          "type": "integer",
-        \\          "default": 1,
-        \\          "description": "Amount to increment/decrement by (default: 1)"
-        \\        }
-        \\      },
-        \\      "required": ["operation"]
-        \\    },
-        \\    "annotations": {
-        \\      "destructive": false,
-        \\      "idempotent": false,
-        \\      "openWorld": false
-        \\    }
-        \\  },
-        \\  {
-        \\    "name": "storage",
-        \\    "title": "Key-Value Storage",
-        \\    "description": "Store and retrieve key-value pairs. Data persists for the lifetime of the server.",
-        \\    "inputSchema": {
-        \\      "type": "object",
-        \\      "properties": {
-        \\        "operation": {
-        \\          "type": "string",
-        \\          "enum": ["get", "set", "delete", "list"],
-        \\          "description": "The storage operation to perform"
-        \\        },
-        \\        "key": {
-        \\          "type": "string",
-        \\          "description": "The key to operate on (required for get/set/delete)"
-        \\        },
-        \\        "value": {
-        \\          "type": "string",
-        \\          "description": "The value to store (required for set)"
-        \\        }
-        \\      },
-        \\      "required": ["operation"]
-        \\    },
-        \\    "annotations": {
-        \\      "destructive": true,
-        \\      "idempotent": false
-        \\    }
-        \\  },
-        \\  {
-        \\    "name": "longTask",
-        \\    "title": "Long-Running Task",
-        \\    "description": "Simulates a long-running task that can be cancelled. Useful for testing cancellation support.",
-        \\    "inputSchema": {
-        \\      "type": "object",
-        \\      "properties": {
-        \\        "durationMs": {
-        \\          "type": "integer",
-        \\          "default": 5000,
-        \\          "description": "How long the task should run in milliseconds"
-        \\        }
-        \\      }
-        \\    },
-        \\    "annotations": {
-        \\      "destructive": false,
-        \\      "idempotent": true
-        \\    }
-        \\  }
-        \\]}
+    \\{"tools":[
+    \\  {
+    \\    "name": "counter",
+    \\    "title": "Persistent Counter",
+    \\    "description": "A counter that persists across calls. Supports increment, decrement, get, and reset operations.",
+    \\    "inputSchema": {
+    \\      "type": "object",
+    \\      "properties": {
+    \\        "operation": {
+    \\          "type": "string",
+    \\          "enum": ["increment", "decrement", "get", "reset"],
+    \\          "description": "The operation to perform on the counter"
+    \\        },
+    \\        "amount": {
+    \\          "type": "integer",
+    \\          "default": 1,
+    \\          "description": "Amount to increment/decrement by (default: 1)"
+    \\        }
+    \\      },
+    \\      "required": ["operation"]
+    \\    },
+    \\    "annotations": {
+    \\      "destructive": false,
+    \\      "idempotent": false,
+    \\      "openWorld": false
+    \\    }
+    \\  },
+    \\  {
+    \\    "name": "storage",
+    \\    "title": "Key-Value Storage",
+    \\    "description": "Store and retrieve key-value pairs. Data persists for the lifetime of the server.",
+    \\    "inputSchema": {
+    \\      "type": "object",
+    \\      "properties": {
+    \\        "operation": {
+    \\          "type": "string",
+    \\          "enum": ["get", "set", "delete", "list"],
+    \\          "description": "The storage operation to perform"
+    \\        },
+    \\        "key": {
+    \\          "type": "string",
+    \\          "description": "The key to operate on (required for get/set/delete)"
+    \\        },
+    \\        "value": {
+    \\          "type": "string",
+    \\          "description": "The value to store (required for set)"
+    \\        }
+    \\      },
+    \\      "required": ["operation"]
+    \\    },
+    \\    "annotations": {
+    \\      "destructive": true,
+    \\      "idempotent": false
+    \\    }
+    \\  },
+    \\  {
+    \\    "name": "longTask",
+    \\    "title": "Long-Running Task",
+    \\    "description": "Simulates a long-running task that can be cancelled. Useful for testing cancellation support.",
+    \\    "inputSchema": {
+    \\      "type": "object",
+    \\      "properties": {
+    \\        "durationMs": {
+    \\          "type": "integer",
+    \\          "default": 5000,
+    \\          "description": "How long the task should run in milliseconds"
+    \\        }
+    \\      }
+    \\    },
+    \\    "annotations": {
+    \\      "destructive": false,
+    \\      "idempotent": true
+    \\    }
+    \\  }
+    \\]}
     ;
 }
 
@@ -212,7 +212,7 @@ fn handleCounter(state: *ServerState, _: []const u8) ![]const u8 {
     _ = new_value;
 
     return
-        \\{"content":[{"type":"text","text":"Counter incremented. Current value: 1"}]}
+    \\{"content":[{"type":"text","text":"Counter incremented. Current value: 1"}]}
     ;
 }
 
@@ -220,14 +220,14 @@ fn handleCounter(state: *ServerState, _: []const u8) ![]const u8 {
 fn handleStorage(state: *ServerState, _: []const u8) ![]const u8 {
     // For this example, we just list the keys
     // In a real implementation, you would parse args_json
-    state.storage_mutex.lock();
-    defer state.storage_mutex.unlock();
+    state.storage_mutex.lockUncancelable(std.Io.Threaded.global_single_threaded.io());
+    defer state.storage_mutex.unlock(std.Io.Threaded.global_single_threaded.io());
 
     const count = state.storage.count();
     _ = count;
 
     return
-        \\{"content":[{"type":"text","text":"Storage contains 0 items"}]}
+    \\{"content":[{"type":"text","text":"Storage contains 0 items"}]}
     ;
 }
 
@@ -241,17 +241,17 @@ fn handleLongTask(cancel: *const mcp.CancelToken, _: []const u8) ![]const u8 {
         // Check for cancellation periodically
         if (cancel.isCancelled()) {
             return
-                \\{"content":[{"type":"text","text":"Task was cancelled"}],"isError":true}
+            \\{"content":[{"type":"text","text":"Task was cancelled"}],"isError":true}
             ;
         }
 
         // Simulate work
-        std.Thread.sleep(sleep_per_iteration);
+        std.Io.Threaded.global_single_threaded.io().sleep(std.Io.Duration.fromNanoseconds(sleep_per_iteration), .awake) catch {};
         _ = i;
     }
 
     return
-        \\{"content":[{"type":"text","text":"Long task completed successfully!"}]}
+    \\{"content":[{"type":"text","text":"Long task completed successfully!"}]}
     ;
 }
 

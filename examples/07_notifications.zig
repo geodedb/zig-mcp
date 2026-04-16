@@ -40,8 +40,8 @@ const DynamicState = struct {
     pub fn init(allocator: std.mem.Allocator) DynamicState {
         return .{
             .allocator = allocator,
-            .tools = .{},
-            .resources = .{},
+            .tools = .empty,
+            .resources = .empty,
         };
     }
 
@@ -97,7 +97,7 @@ const DynamicState = struct {
 var global_state: ?*DynamicState = null;
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -159,7 +159,7 @@ pub fn main() !void {
     std.debug.print("\nPress Ctrl+C to stop\n", .{});
 
     while (true) {
-        std.Thread.sleep(std.time.ns_per_s);
+        std.Io.Threaded.global_single_threaded.io().sleep(std.Io.Duration.fromSeconds(1), .awake) catch {};
     }
 }
 
@@ -170,55 +170,55 @@ pub fn main() !void {
 fn listTools(_: ?*anyopaque, _: ?[]const u8) anyerror![]const u8 {
     // Return current tools (in a real implementation, build dynamically)
     return
-        \\{"tools":[
-        \\  {
-        \\    "name": "add-tool",
-        \\    "description": "Add a new tool dynamically (triggers notifications/tools/list_changed)",
-        \\    "inputSchema": {
-        \\      "type": "object",
-        \\      "properties": {
-        \\        "name": { "type": "string" },
-        \\        "description": { "type": "string" }
-        \\      },
-        \\      "required": ["name", "description"]
-        \\    }
-        \\  },
-        \\  {
-        \\    "name": "add-resource",
-        \\    "description": "Add a new resource dynamically (triggers notifications/resources/list_changed)",
-        \\    "inputSchema": {
-        \\      "type": "object",
-        \\      "properties": {
-        \\        "uri": { "type": "string" },
-        \\        "name": { "type": "string" }
-        \\      },
-        \\      "required": ["uri", "name"]
-        \\    }
-        \\  },
-        \\  {
-        \\    "name": "update-resource",
-        \\    "description": "Notify about a resource update (triggers notifications/resources/updated)",
-        \\    "inputSchema": {
-        \\      "type": "object",
-        \\      "properties": {
-        \\        "uri": { "type": "string", "description": "URI of the updated resource" }
-        \\      },
-        \\      "required": ["uri"]
-        \\    }
-        \\  },
-        \\  {
-        \\    "name": "log",
-        \\    "description": "Emit a log message to clients (triggers notifications/message)",
-        \\    "inputSchema": {
-        \\      "type": "object",
-        \\      "properties": {
-        \\        "level": { "type": "string", "enum": ["debug", "info", "warning", "error"] },
-        \\        "message": { "type": "string" }
-        \\      },
-        \\      "required": ["level", "message"]
-        \\    }
-        \\  }
-        \\]}
+    \\{"tools":[
+    \\  {
+    \\    "name": "add-tool",
+    \\    "description": "Add a new tool dynamically (triggers notifications/tools/list_changed)",
+    \\    "inputSchema": {
+    \\      "type": "object",
+    \\      "properties": {
+    \\        "name": { "type": "string" },
+    \\        "description": { "type": "string" }
+    \\      },
+    \\      "required": ["name", "description"]
+    \\    }
+    \\  },
+    \\  {
+    \\    "name": "add-resource",
+    \\    "description": "Add a new resource dynamically (triggers notifications/resources/list_changed)",
+    \\    "inputSchema": {
+    \\      "type": "object",
+    \\      "properties": {
+    \\        "uri": { "type": "string" },
+    \\        "name": { "type": "string" }
+    \\      },
+    \\      "required": ["uri", "name"]
+    \\    }
+    \\  },
+    \\  {
+    \\    "name": "update-resource",
+    \\    "description": "Notify about a resource update (triggers notifications/resources/updated)",
+    \\    "inputSchema": {
+    \\      "type": "object",
+    \\      "properties": {
+    \\        "uri": { "type": "string", "description": "URI of the updated resource" }
+    \\      },
+    \\      "required": ["uri"]
+    \\    }
+    \\  },
+    \\  {
+    \\    "name": "log",
+    \\    "description": "Emit a log message to clients (triggers notifications/message)",
+    \\    "inputSchema": {
+    \\      "type": "object",
+    \\      "properties": {
+    \\        "level": { "type": "string", "enum": ["debug", "info", "warning", "error"] },
+    \\        "message": { "type": "string" }
+    \\      },
+    \\      "required": ["level", "message"]
+    \\    }
+    \\  }
+    \\]}
     ;
 }
 
@@ -234,28 +234,28 @@ fn callTool(
         // In a real implementation, parse args and add the tool
         try state.addTool("new-dynamic-tool", "A dynamically added tool");
         return
-            \\{"content":[{"type":"text","text":"Tool added! Notification sent to clients."}]}
+        \\{"content":[{"type":"text","text":"Tool added! Notification sent to clients."}]}
         ;
     }
 
     if (std.mem.eql(u8, name, "add-resource")) {
         try state.addResource("data://dynamic", "Dynamic Resource");
         return
-            \\{"content":[{"type":"text","text":"Resource added! Notification sent to clients."}]}
+        \\{"content":[{"type":"text","text":"Resource added! Notification sent to clients."}]}
         ;
     }
 
     if (std.mem.eql(u8, name, "update-resource")) {
         state.updateResource("data://counter");
         return
-            \\{"content":[{"type":"text","text":"Resource update notification sent!"}]}
+        \\{"content":[{"type":"text","text":"Resource update notification sent!"}]}
         ;
     }
 
     if (std.mem.eql(u8, name, "log")) {
         state.emitLog("info", "This is a log message from the server");
         return
-            \\{"content":[{"type":"text","text":"Log message emitted to clients!"}]}
+        \\{"content":[{"type":"text","text":"Log message emitted to clients!"}]}
         ;
     }
 
@@ -264,16 +264,16 @@ fn callTool(
 
 fn listResources(_: ?*anyopaque, _: ?[]const u8) anyerror![]const u8 {
     return
-        \\{"resources":[
-        \\  {"uri": "data://counter", "name": "Dynamic Counter", "mimeType": "application/json"}
-        \\]}
+    \\{"resources":[
+    \\  {"uri": "data://counter", "name": "Dynamic Counter", "mimeType": "application/json"}
+    \\]}
     ;
 }
 
 fn readResource(_: ?*anyopaque, uri: []const u8) anyerror![]const u8 {
     if (std.mem.eql(u8, uri, "data://counter")) {
         return
-            \\{"contents":[{"uri":"data://counter","mimeType":"application/json","text":"{\"count\":42}"}]}
+        \\{"contents":[{"uri":"data://counter","mimeType":"application/json","text":"{\"count\":42}"}]}
         ;
     }
     return error.ResourceNotFound;

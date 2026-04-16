@@ -15,6 +15,10 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+inline fn io() std.Io {
+    return std.Io.Threaded.global_single_threaded.io();
+}
+
 /// Maximum number of pipelined requests
 pub const max_pipeline_depth = 100;
 
@@ -115,7 +119,7 @@ pub const PipelineStats = struct {
 pub const Pipeline = struct {
     allocator: Allocator,
     /// Queue of requests
-    requests: std.ArrayListUnmanaged(PipelinedRequest) = .{},
+    requests: std.ArrayListUnmanaged(PipelinedRequest) = .empty,
     /// Next request ID
     next_id: u64,
     /// Maximum pipeline depth
@@ -127,7 +131,7 @@ pub const Pipeline = struct {
     /// Keep-alive settings
     keep_alive: KeepAlive,
     /// Mutex for thread safety
-    mutex: std.Thread.Mutex,
+    mutex: std.Io.Mutex,
 
     pub const ConnectionState = enum {
         disconnected,
@@ -152,14 +156,14 @@ pub const Pipeline = struct {
             .stats = .{},
             .connection_state = .disconnected,
             .keep_alive = .{},
-            .mutex = .{},
+            .mutex = std.Io.Mutex.init,
         };
     }
 
     /// Deinitialize the pipeline
     pub fn deinit(self: *Pipeline) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(io());
+        defer self.mutex.unlock(io());
 
         for (self.requests.items) |*req| {
             self.freeRequest(req);
@@ -193,8 +197,8 @@ pub const Pipeline = struct {
         headers: []const PipelinedRequest.Header,
         body: ?[]const u8,
     ) !u64 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(io());
+        defer self.mutex.unlock(io());
 
         // Check pipeline depth
         var pending: u32 = 0;
@@ -235,7 +239,7 @@ pub const Pipeline = struct {
             .state = .queued,
             .response = null,
             .err = null,
-            .queued_at = std.time.timestamp(),
+            .queued_at = std.Io.Timestamp.now(io(), .real).toSeconds(),
             .sent_at = null,
             .completed_at = null,
         });
@@ -248,8 +252,8 @@ pub const Pipeline = struct {
 
     /// Get the next request to send
     pub fn getNextToSend(self: *Pipeline) ?*PipelinedRequest {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(io());
+        defer self.mutex.unlock(io());
 
         for (self.requests.items) |*req| {
             if (req.state == .queued) {
@@ -261,13 +265,13 @@ pub const Pipeline = struct {
 
     /// Mark a request as sent
     pub fn markSent(self: *Pipeline, id: u64) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(io());
+        defer self.mutex.unlock(io());
 
         for (self.requests.items) |*req| {
             if (req.id == id and req.state == .queued) {
                 req.state = .sent;
-                req.sent_at = std.time.timestamp();
+                req.sent_at = std.Io.Timestamp.now(io(), .real).toSeconds();
                 break;
             }
         }
@@ -281,8 +285,8 @@ pub const Pipeline = struct {
         headers: []const PipelinedRequest.Header,
         body: []const u8,
     ) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(io());
+        defer self.mutex.unlock(io());
 
         for (self.requests.items) |*req| {
             if (req.id == id and req.state == .sent) {
@@ -301,7 +305,7 @@ pub const Pipeline = struct {
                     .body = try self.allocator.dupe(u8, body),
                 };
                 req.state = .completed;
-                req.completed_at = std.time.timestamp();
+                req.completed_at = std.Io.Timestamp.now(io(), .real).toSeconds();
 
                 self.stats.successful_requests += 1;
                 if (self.stats.pending_requests > 0) {
@@ -321,14 +325,14 @@ pub const Pipeline = struct {
 
     /// Fail a request
     pub fn failRequest(self: *Pipeline, id: u64, err: anyerror) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(io());
+        defer self.mutex.unlock(io());
 
         for (self.requests.items) |*req| {
             if (req.id == id and (req.state == .queued or req.state == .sent)) {
                 req.state = .failed;
                 req.err = err;
-                req.completed_at = std.time.timestamp();
+                req.completed_at = std.Io.Timestamp.now(io(), .real).toSeconds();
 
                 self.stats.failed_requests += 1;
                 if (self.stats.pending_requests > 0) {
@@ -341,8 +345,8 @@ pub const Pipeline = struct {
 
     /// Cancel a request
     pub fn cancelRequest(self: *Pipeline, id: u64) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(io());
+        defer self.mutex.unlock(io());
 
         for (self.requests.items) |*req| {
             if (req.id == id) {
@@ -362,8 +366,8 @@ pub const Pipeline = struct {
 
     /// Get request by ID
     pub fn getRequest(self: *Pipeline, id: u64) ?*const PipelinedRequest {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(io());
+        defer self.mutex.unlock(io());
 
         for (self.requests.items) |*req| {
             if (req.id == id) {
@@ -375,8 +379,8 @@ pub const Pipeline = struct {
 
     /// Remove completed/failed/cancelled requests
     pub fn cleanup(self: *Pipeline) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(io());
+        defer self.mutex.unlock(io());
 
         var i: usize = 0;
         while (i < self.requests.items.len) {
@@ -392,8 +396,8 @@ pub const Pipeline = struct {
 
     /// Get statistics
     pub fn getStats(self: *Pipeline) PipelineStats {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(io());
+        defer self.mutex.unlock(io());
         return self.stats;
     }
 
@@ -495,19 +499,19 @@ pub const Pipeline = struct {
 pub const PipelineManager = struct {
     allocator: Allocator,
     pipelines: std.StringHashMap(*Pipeline),
-    mutex: std.Thread.Mutex,
+    mutex: std.Io.Mutex,
 
     pub fn init(allocator: Allocator) PipelineManager {
         return .{
             .allocator = allocator,
             .pipelines = std.StringHashMap(*Pipeline).init(allocator),
-            .mutex = .{},
+            .mutex = std.Io.Mutex.init,
         };
     }
 
     pub fn deinit(self: *PipelineManager) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(io());
+        defer self.mutex.unlock(io());
 
         var iter = self.pipelines.iterator();
         while (iter.next()) |entry| {
@@ -519,8 +523,8 @@ pub const PipelineManager = struct {
 
     /// Get or create pipeline for a host
     pub fn getPipeline(self: *PipelineManager, host: []const u8) !*Pipeline {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(io());
+        defer self.mutex.unlock(io());
 
         if (self.pipelines.get(host)) |pipeline| {
             return pipeline;
@@ -537,8 +541,8 @@ pub const PipelineManager = struct {
 
     /// Get aggregate statistics
     pub fn getStats(self: *PipelineManager) PipelineStats {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(io());
+        defer self.mutex.unlock(io());
 
         var stats = PipelineStats{};
         var iter = self.pipelines.iterator();
@@ -637,10 +641,10 @@ test "request serialization" {
     const req = pipeline.getRequest(id).?;
 
     var buf: [1024]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    try pipeline.serializeRequest(req, fbs.writer());
+    var fbs: std.Io.Writer = .fixed(&buf);
+    try pipeline.serializeRequest(req, &fbs);
 
-    const output = fbs.getWritten();
+    const output = fbs.buffered();
     try std.testing.expect(std.mem.indexOf(u8, output, "POST /mcp HTTP/1.1") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Host: localhost") != null);
 }
