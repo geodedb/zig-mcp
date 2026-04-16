@@ -1158,7 +1158,10 @@ test "batch processing dispatches via thread-pool when pool is set" {
         \\{"jsonrpc":"2.0","method":"notifications/initialized"}
     );
 
-    // Build a batch of 8 ping requests (each a notification so no response, but each is a dispatch unit).
+    // Build a batch of 8 ping requests. Each carries an `id`, so each is a
+    // request (not a notification); mcp's ping handler returns the empty
+    // result object `{}` per JSON-RPC convention. Each request is a distinct
+    // dispatch unit so the pool should see >= 8 submissions.
     const batch =
         \\[
         \\ {"jsonrpc":"2.0","id":1,"method":"ping"},
@@ -1177,4 +1180,69 @@ test "batch processing dispatches via thread-pool when pool is set" {
     const after = pool.statsSnapshot().submitted;
 
     try std.testing.expect(after - before >= 8);
+}
+
+test "batch processing does not deadlock under pool backpressure" {
+    const allocator = std.testing.allocator;
+
+    // Tiny queue_capacity forces submitBatch into its partial-submit path:
+    // the first few tasks fit, the rest return `QueueFull` under the default
+    // `.return_error` backpressure policy and submitBatch returns with
+    // `result.submitted < tasks.len`. A broken wait-group pairing in the
+    // batch dispatch code would manifest here as wg.wait() hanging forever.
+    // queue_capacity is rounded up to a power of two and must be > 0, so
+    // the smallest accepted value is 1 — use 2 to leave room for one task
+    // to actually dequeue. local_queue_capacity also rounds up; 1 is valid.
+    const tp = @import("thread_pool");
+    var pool = try tp.ThreadPool.init(allocator, .{
+        .max_threads = 1,
+        .min_threads = 1,
+        .queue_capacity = 2,
+        .local_queue_capacity = 1,
+    });
+    defer pool.deinit();
+
+    var server = try mcp.Server.init(allocator, .{
+        .name = "test-server",
+        .version = "1.0.0",
+        .worker_threads = 1,
+    }, mcp.DemoHandler.create());
+    defer server.deinit();
+    server.pool = &pool;
+
+    const init_request =
+        \\{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}
+    ;
+    if (try server.processMessage(init_request)) |r| allocator.free(r);
+    _ = try server.processMessage(
+        \\{"jsonrpc":"2.0","method":"notifications/initialized"}
+    );
+
+    // 16 items vs queue_capacity=2 guarantees backpressure on the
+    // submitBatch call — more than enough items to exceed the queue even
+    // after rounding.
+    const batch =
+        \\[
+        \\ {"jsonrpc":"2.0","id":1,"method":"ping"},
+        \\ {"jsonrpc":"2.0","id":2,"method":"ping"},
+        \\ {"jsonrpc":"2.0","id":3,"method":"ping"},
+        \\ {"jsonrpc":"2.0","id":4,"method":"ping"},
+        \\ {"jsonrpc":"2.0","id":5,"method":"ping"},
+        \\ {"jsonrpc":"2.0","id":6,"method":"ping"},
+        \\ {"jsonrpc":"2.0","id":7,"method":"ping"},
+        \\ {"jsonrpc":"2.0","id":8,"method":"ping"},
+        \\ {"jsonrpc":"2.0","id":9,"method":"ping"},
+        \\ {"jsonrpc":"2.0","id":10,"method":"ping"},
+        \\ {"jsonrpc":"2.0","id":11,"method":"ping"},
+        \\ {"jsonrpc":"2.0","id":12,"method":"ping"},
+        \\ {"jsonrpc":"2.0","id":13,"method":"ping"},
+        \\ {"jsonrpc":"2.0","id":14,"method":"ping"},
+        \\ {"jsonrpc":"2.0","id":15,"method":"ping"},
+        \\ {"jsonrpc":"2.0","id":16,"method":"ping"}
+        \\]
+    ;
+
+    // If the dispatch path mispairs wg.add/done, this call hangs forever
+    // and the test runner kills it. Successful return is itself the assert.
+    if (try server.processMessage(batch)) |resp| allocator.free(resp);
 }

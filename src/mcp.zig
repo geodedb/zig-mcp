@@ -2686,8 +2686,23 @@ pub const Server = struct {
             r.* = .{ .response = null, .index = 0 };
         }
 
-        // Process in parallel via thread-pool if one is attached, otherwise sequential
-        if (self.pool) |pool| if (self.options.worker_threads > 0 and items.len > 1) {
+        // Precomputed parallelism predicate — sequential when single item or
+        // worker_threads is 0. The three-branch structure below keeps the
+        // pool-managed-WaitGroup path, the std.Thread.spawn fallback, and the
+        // sequential default flat and easy to audit.
+        const parallel = self.options.worker_threads > 0 and items.len > 1;
+
+        if (!parallel) {
+            // Sequential processing (single item or parallelism disabled).
+            for (items, 0..) |item, i| {
+                const response = try self.processJsonValue(item);
+                results[i] = .{ .response = response, .index = i };
+            }
+        } else if (self.pool) |pool| {
+            // Pool-managed WaitGroup: the pool calls add(1) on each
+            // successful submission and done() on completion/cancellation.
+            // Partial submits under backpressure are therefore safe — the
+            // caller must NOT add(1) per item or call done() in the task.
             var wg = pool.waitGroup();
 
             const ItemCtx = struct {
@@ -2695,13 +2710,11 @@ pub const Server = struct {
                 item: json.Value,
                 index: usize,
                 results: []BatchItemResult,
-                wg: *tp.WaitGroup,
 
                 fn run(ctx_: *anyopaque, _: *tp.TaskContext) void {
                     const c: *@This() = @ptrCast(@alignCast(ctx_));
                     const response = c.server.processJsonValue(c.item) catch null;
                     c.results[c.index] = .{ .response = response, .index = c.index };
-                    c.wg.done();
                 }
             };
 
@@ -2711,27 +2724,34 @@ pub const Server = struct {
             defer self.allocator.free(tasks);
 
             for (items, 0..) |item, i| {
-                ctxs[i] = .{ .server = self, .item = item, .index = i, .results = results, .wg = &wg };
+                ctxs[i] = .{ .server = self, .item = item, .index = i, .results = results };
                 tasks[i] = .{ .task_fn = ItemCtx.run, .ctx = &ctxs[i] };
-                wg.add(1);
             }
 
-            _ = try pool.submitBatch(tasks, .{});
+            const result = try pool.submitBatch(tasks, .{ .wait_group = &wg });
             wg.wait();
-        } else {
-            // Sequential processing (single item or explicitly disabled)
-            for (items, 0..) |item, i| {
-                const response = try self.processJsonValue(item);
-                results[i] = .{ .response = response, .index = i };
+
+            // Any tasks the pool rejected under backpressure were never added
+            // to the wait group and must be processed inline so their results
+            // land in `results[]`.
+            if (result.submitted < items.len) {
+                for (items[result.submitted..], result.submitted..) |item, i| {
+                    const response = self.processJsonValue(item) catch null;
+                    results[i] = .{ .response = response, .index = i };
+                }
             }
-        } else if (self.options.worker_threads > 0 and items.len > 1) {
-            // Fallback: no pool attached (e.g. Task 3 hasn't landed yet or test harness
-            // didn't inject one) — use the original std.Thread.spawn path.
+        } else {
+            // Fallback: no pool attached (e.g. Task 3 hasn't landed yet or test
+            // harness didn't inject one) — use the original std.Thread.spawn
+            // path. Fails over to sequential processing for any item whose
+            // thread spawn fails.
             const threads = try self.allocator.alloc(std.Thread, items.len);
             defer self.allocator.free(threads);
 
             for (items, 0..) |item, i| {
                 threads[i] = std.Thread.spawn(.{}, batchItemWorker, .{ self, item, i, results }) catch {
+                    // Spawn failed — finish the remaining items inline rather
+                    // than leaving them unprocessed, and stop spawning more.
                     for (items[i..], i..) |remaining_item, j| {
                         const response = self.processJsonValue(remaining_item) catch null;
                         results[j] = .{ .response = response, .index = j };
@@ -2742,11 +2762,6 @@ pub const Server = struct {
 
             for (threads) |t| {
                 t.join();
-            }
-        } else {
-            for (items, 0..) |item, i| {
-                const response = try self.processJsonValue(item);
-                results[i] = .{ .response = response, .index = i };
             }
         }
 
