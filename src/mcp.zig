@@ -1415,13 +1415,14 @@ pub const Server = struct {
     oauth_client_metadata_cache: std.StringHashMapUnmanaged(CachedClientMetadata) = .{},
 
     // Worker pool
-    workers: []std.Thread = &.{},
-    work_queue: std.ArrayListUnmanaged(WorkItem) = .empty,
     shutdown: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
-    /// Shared thread-pool for batch work. Initialized by startWorkers (Task 3
-    /// will replace the bespoke `workers: []std.Thread` field entirely).
+    /// Shared thread-pool for batch work and future work-submission. When
+    /// `own_pool` is true the Server created it in `startWorkers` and must
+    /// destroy it in `deinit`; otherwise it was injected externally (tests)
+    /// and the Server must NOT free it.
     pool: ?*tp.ThreadPool = null,
+    own_pool: bool = false,
 
     // Stdio (with buffered I/O - Zig 0.15 API)
     stdin_file: ?std.Io.File = null,
@@ -1453,12 +1454,6 @@ pub const Server = struct {
         stopped,
     };
 
-    const WorkItem = struct {
-        request_data: []const u8,
-        session: *Session,
-        cancel_token: CancelToken,
-    };
-
     const SseConnection = struct {
         stream: std.Io.net.Stream,
         session_id: []const u8,
@@ -1482,20 +1477,40 @@ pub const Server = struct {
     }
 
     fn startWorkers(self: *Server) !void {
-        if (self.options.worker_threads > 0 and self.workers.len == 0) {
-            self.workers = try self.allocator.alloc(std.Thread, self.options.worker_threads);
-            for (self.workers) |*w| {
-                w.* = try std.Thread.spawn(.{}, workerThread, .{self});
-            }
-        }
+        if (self.pool != null) return; // Externally injected or already started.
+        if (self.options.worker_threads == 0) return;
+
+        const pool = try self.allocator.create(tp.ThreadPool);
+        errdefer self.allocator.destroy(pool);
+
+        pool.* = try tp.ThreadPool.init(self.allocator, .{
+            .max_threads = self.options.worker_threads,
+        });
+        self.pool = pool;
+        self.own_pool = true;
+    }
+
+    /// Test-only entry point for exercising `startWorkers` without spinning up
+    /// serveStdio / serveHttp. Idempotent — safe to call more than once; no-op
+    /// when a pool is already attached (server-owned or externally injected).
+    pub fn ensureWorkers(self: *Server) !void {
+        try self.startWorkers();
     }
 
     pub fn deinit(self: *Server) void {
         self.stop();
 
-        // Clean up workers
-        if (self.workers.len > 0) {
-            self.allocator.free(self.workers);
+        // Shut down and destroy the owned thread pool before tearing down
+        // sessions / SSE connections so any in-flight tasks still observing
+        // those resources complete (or are cancelled) first.
+        if (self.pool) |pool| {
+            if (self.own_pool) {
+                // Best-effort graceful shutdown; fall through on error.
+                pool.shutdown(.drain, 5 * std.time.ns_per_s) catch {};
+                pool.deinit();
+                self.allocator.destroy(pool);
+            }
+            self.pool = null;
         }
 
         // Clean up SSE connections
@@ -1523,8 +1538,6 @@ pub const Server = struct {
 
         // Clean up active requests (GAP-024)
         self.active_requests.deinit(self.allocator);
-
-        self.work_queue.deinit(self.allocator);
 
         if (self.session) |*s| {
             s.deinit();
@@ -1911,33 +1924,13 @@ pub const Server = struct {
             self.http_listener = null;
         }
 
-        // Finally signal workers to stop and join them
-        for (self.workers) |*w| {
-            w.join();
-        }
+        // The shared thread-pool is shut down in deinit — stop() only tears
+        // down listeners/accept loops.
     }
 
     // ========================================================================
     // Internal Methods
     // ========================================================================
-
-    fn workerThread(self: *Server) void {
-        while (!self.shutdown.load(.acquire)) {
-            var item: ?WorkItem = null;
-            {
-                self.sse_mutex.lockUncancelable(io());
-                defer self.sse_mutex.unlock(io());
-                if (self.work_queue.items.len > 0) {
-                    item = self.work_queue.orderedRemove(0);
-                }
-            }
-            if (item) |work| {
-                _ = self.processMessage(work.request_data) catch {};
-            } else {
-                io().sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
-            }
-        }
-    }
 
     fn httpServerThread(self: *Server) void {
         while (self.state == .running) {
@@ -2641,11 +2634,6 @@ pub const Server = struct {
         index: usize,
     };
 
-    fn batchItemWorker(self: *Server, item: json.Value, index: usize, results: []BatchItemResult) void {
-        const response = self.processJsonValue(item) catch null;
-        results[index] = .{ .response = response, .index = index };
-    }
-
     fn processBatch(self: *Server, data: []const u8) !?[]const u8 {
         var err_info = json.ParseError.init();
         var doc = json.parse(self.allocator, data, .{
@@ -2686,19 +2674,28 @@ pub const Server = struct {
             r.* = .{ .response = null, .index = 0 };
         }
 
-        // Precomputed parallelism predicate — sequential when single item or
-        // worker_threads is 0. The three-branch structure below keeps the
-        // pool-managed-WaitGroup path, the std.Thread.spawn fallback, and the
-        // sequential default flat and easy to audit.
+        // Parallelism predicate — sequential when single item or parallelism
+        // explicitly disabled. Otherwise lazily start the shared pool so
+        // callers driving us directly via `processMessage` (tests, library
+        // consumers) get parallel dispatch without having to spin up
+        // `serveStdio` / `serveHttp` first. `startWorkers` is idempotent.
         const parallel = self.options.worker_threads > 0 and items.len > 1;
 
-        if (!parallel) {
-            // Sequential processing (single item or parallelism disabled).
+        if (parallel and self.pool == null) {
+            // Best-effort — if pool creation fails we fall through to the
+            // sequential path below.
+            self.startWorkers() catch {};
+        }
+
+        if (!parallel or self.pool == null) {
+            // Sequential processing (single item, parallelism disabled, or
+            // pool couldn't be created).
             for (items, 0..) |item, i| {
                 const response = try self.processJsonValue(item);
                 results[i] = .{ .response = response, .index = i };
             }
-        } else if (self.pool) |pool| {
+        } else {
+            const pool = self.pool.?;
             // Pool-managed WaitGroup: the pool calls add(1) on each
             // successful submission and done() on completion/cancellation.
             // Partial submits under backpressure are therefore safe — the
@@ -2739,29 +2736,6 @@ pub const Server = struct {
                     const response = self.processJsonValue(item) catch null;
                     results[i] = .{ .response = response, .index = i };
                 }
-            }
-        } else {
-            // Fallback: no pool attached (e.g. Task 3 hasn't landed yet or test
-            // harness didn't inject one) — use the original std.Thread.spawn
-            // path. Fails over to sequential processing for any item whose
-            // thread spawn fails.
-            const threads = try self.allocator.alloc(std.Thread, items.len);
-            defer self.allocator.free(threads);
-
-            for (items, 0..) |item, i| {
-                threads[i] = std.Thread.spawn(.{}, batchItemWorker, .{ self, item, i, results }) catch {
-                    // Spawn failed — finish the remaining items inline rather
-                    // than leaving them unprocessed, and stop spawning more.
-                    for (items[i..], i..) |remaining_item, j| {
-                        const response = self.processJsonValue(remaining_item) catch null;
-                        results[j] = .{ .response = response, .index = j };
-                    }
-                    break;
-                };
-            }
-
-            for (threads) |t| {
-                t.join();
             }
         }
 

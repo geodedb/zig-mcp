@@ -1246,3 +1246,32 @@ test "batch processing does not deadlock under pool backpressure" {
     // and the test runner kills it. Successful return is itself the assert.
     if (try server.processMessage(batch)) |resp| allocator.free(resp);
 }
+
+test "startWorkers creates a server-owned thread-pool and deinit destroys it" {
+    const allocator = std.testing.allocator;
+
+    var server = try mcp.Server.init(allocator, .{
+        .name = "test-server",
+        .version = "1.0.0",
+        .worker_threads = 2,
+    }, mcp.DemoHandler.create());
+    defer server.deinit();
+
+    // No pool attached until startWorkers runs.
+    try std.testing.expect(server.pool == null);
+    try std.testing.expect(!server.own_pool);
+
+    try server.ensureWorkers();
+
+    // Pool is now server-owned.
+    try std.testing.expect(server.pool != null);
+    try std.testing.expect(server.own_pool);
+
+    // Idempotent — calling again must not leak or replace the pool.
+    const before = server.pool.?;
+    try server.ensureWorkers();
+    try std.testing.expect(server.pool.? == before);
+
+    // server.deinit() runs via defer and must shutdown + destroy the owned
+    // pool. Test uses testing.allocator which would flag any leak.
+}
