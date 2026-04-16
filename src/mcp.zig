@@ -1476,6 +1476,11 @@ pub const Server = struct {
         return server;
     }
 
+    /// Creates the server-owned thread-pool. Intended to be called from the
+    /// server's owning thread (serve* entry points and processMessage, which
+    /// today run serially per-server). NOT thread-safe against itself: two
+    /// concurrent invocations on a null pool could each create a pool and
+    /// leak one.
     fn startWorkers(self: *Server) !void {
         if (self.pool != null) return; // Externally injected or already started.
         if (self.options.worker_threads == 0) return;
@@ -2684,7 +2689,9 @@ pub const Server = struct {
         if (parallel and self.pool == null) {
             // Best-effort — if pool creation fails we fall through to the
             // sequential path below.
-            self.startWorkers() catch {};
+            self.startWorkers() catch |err| {
+                std.log.warn("mcp: failed to start thread-pool for batch processing ({s}); falling back to sequential", .{@errorName(err)});
+            };
         }
 
         if (!parallel or self.pool == null) {

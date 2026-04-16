@@ -1275,3 +1275,41 @@ test "startWorkers creates a server-owned thread-pool and deinit destroys it" {
     // server.deinit() runs via defer and must shutdown + destroy the owned
     // pool. Test uses testing.allocator which would flag any leak.
 }
+
+test "processBatch lazy-creates thread-pool when no pool is attached" {
+    const allocator = std.testing.allocator;
+
+    var server = try mcp.Server.init(allocator, .{
+        .name = "test-server",
+        .version = "1.0.0",
+        .worker_threads = 2,
+    }, mcp.DemoHandler.create());
+    defer server.deinit();
+
+    // No ensureWorkers, no serve* — pool must be null going in.
+    try std.testing.expect(server.pool == null);
+    try std.testing.expect(!server.own_pool);
+
+    // Protocol handshake.
+    const init_request =
+        \\{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}
+    ;
+    if (try server.processMessage(init_request)) |r| allocator.free(r);
+    _ = try server.processMessage(
+        \\{"jsonrpc":"2.0","method":"notifications/initialized"}
+    );
+
+    // Send a batch of 4 pings — this triggers processBatch → lazy startWorkers.
+    const batch =
+        \\[
+        \\ {"jsonrpc":"2.0","id":1,"method":"ping"},
+        \\ {"jsonrpc":"2.0","id":2,"method":"ping"},
+        \\ {"jsonrpc":"2.0","id":3,"method":"ping"},
+        \\ {"jsonrpc":"2.0","id":4,"method":"ping"}
+        \\]
+    ;
+    if (try server.processMessage(batch)) |resp| allocator.free(resp);
+
+    try std.testing.expect(server.pool != null);
+    try std.testing.expect(server.own_pool);
+}
