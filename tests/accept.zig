@@ -1313,3 +1313,31 @@ test "processBatch lazy-creates thread-pool when no pool is attached" {
     try std.testing.expect(server.pool != null);
     try std.testing.expect(server.own_pool);
 }
+
+test "parallel module is re-exported from mcp public API" {
+    // The re-export itself is the spec contract — this test ensures the
+    // module is reachable and that its public types/functions compile
+    // through the re-exported namespace. Functional tests for individual
+    // parallel ops live in src/parallel.zig or dedicated test files.
+    _ = mcp.parallel.JsonRpcRequest;
+    _ = mcp.parallel.JsonRpcResponse;
+    _ = mcp.parallel.RequestHandler;
+    _ = mcp.parallel.ToolCall;
+    _ = mcp.parallel.ToolResult;
+    _ = mcp.parallel.SseClient;
+    _ = mcp.parallel.SseEvent;
+    _ = mcp.parallel.ResourceReadRequest;
+    _ = mcp.parallel.PromptTemplate;
+
+    // Callable functions exist via the re-export.
+    _ = @TypeOf(mcp.parallel.getPool);
+    _ = @TypeOf(mcp.parallel.deinitPool);
+    _ = @TypeOf(mcp.parallel.parallelBatchProcess);
+    _ = @TypeOf(mcp.parallel.parallelSseBroadcast);
+    _ = @TypeOf(mcp.parallel.parallelToolExecute);
+    _ = @TypeOf(mcp.parallel.parallelResourceRead);
+    _ = @TypeOf(mcp.parallel.parallelPromptRender);
+
+    // deinitPool is always safe to call (no-op if pool never initialized).
+    mcp.parallel.deinitPool();
+}

@@ -20,6 +20,10 @@ const tp = @import("thread_pool");
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 
+/// Parallel MCP helpers (batch JSON-RPC, SSE broadcast, tool/resource/prompt
+/// fan-out). Re-exported for downstream consumers.
+pub const parallel = @import("parallel.zig");
+
 inline fn io() std.Io {
     return std.Io.Threaded.global_single_threaded.io();
 }
@@ -2687,9 +2691,9 @@ pub const Server = struct {
         // callers driving us directly via `processMessage` (tests, library
         // consumers) get parallel dispatch without having to spin up
         // `serveStdio` / `serveHttp` first. `startWorkers` is idempotent.
-        const parallel = self.options.worker_threads > 0 and items.len > 1;
+        const use_parallel = self.options.worker_threads > 0 and items.len > 1;
 
-        if (parallel and self.pool == null) {
+        if (use_parallel and self.pool == null) {
             // Best-effort — if pool creation fails we fall through to the
             // sequential path below.
             self.startWorkers() catch |err| {
@@ -2697,7 +2701,7 @@ pub const Server = struct {
             };
         }
 
-        if (!parallel or self.pool == null) {
+        if (!use_parallel or self.pool == null) {
             // Sequential processing (single item, parallelism disabled, or
             // pool couldn't be created).
             for (items, 0..) |item, i| {
