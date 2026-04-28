@@ -459,6 +459,19 @@ pub fn build(b: *std.Build) void {
         // tree can find it (consistent with dns/grpc-zig).
         observability_mod.addImport("otel", otel_module);
         mcp_mod.addImport("otel", otel_module);
+
+        // Bootstrap helper. Only registered when `-Dwith_otel=true` so
+        // the disabled build never compiles otel-touching code. Gated
+        // from src/mcp.zig via `if (observability.enabled) @import("observability_init")`.
+        const observability_init_mod = b.addModule("observability_init", .{
+            .root_source_file = b.path("src/observability_init.zig"),
+            .target = target,
+            .imports = &.{
+                .{ .name = "otel", .module = otel_module },
+                .{ .name = "observability", .module = observability_mod },
+            },
+        });
+        mcp_mod.addImport("observability_init", observability_init_mod);
     }
 
     // Disabled-mode no-op tests. Verifies `build_options.with_otel ==
@@ -478,4 +491,34 @@ pub fn build(b: *std.Build) void {
     });
     const run_observability_disabled_tests = b.addRunArtifact(observability_disabled_tests);
     test_step.dependOn(&run_observability_disabled_tests.step);
+
+    // Enabled-mode smoke test. Skips under -Dwith_otel=false; under
+    // -Dwith_otel=true it installs an in-memory recorder, drives one
+    // RPC span through the seam, and asserts the recorder captured it.
+    // Compiles cleanly under both flag values because the otel-namespace
+    // identifiers sit behind `comptime if (enabled)` short-circuits.
+    const observability_enabled_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/observability_enabled_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "mcp", .module = mcp_mod },
+                .{ .name = "build_options", .module = build_options_mod },
+            },
+        }),
+    });
+    if (with_otel) {
+        // Re-resolve the otel module under the same `with_otel` guard
+        // so the smoke test reaches `@import("otel")`. The earlier
+        // `lazyDependency` call handles `mcp_mod`; the test root needs
+        // its own import wire.
+        const otel_dep = b.lazyDependency("otel", .{
+            .target = target,
+            .optimize = optimize,
+        }) orelse return;
+        observability_enabled_tests.root_module.addImport("otel", otel_dep.module("otel"));
+    }
+    const run_observability_enabled_tests = b.addRunArtifact(observability_enabled_tests);
+    test_step.dependOn(&run_observability_enabled_tests.step);
 }

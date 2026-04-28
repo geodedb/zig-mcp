@@ -31,6 +31,17 @@ pub const parallel = @import("parallel.zig");
 /// so it lives in a single module tree across all consumers.
 pub const observability = @import("observability");
 
+/// Bootstrap helper: builds OTEL TracerProvider/MeterProvider/LoggerProvider
+/// from OTEL_* env vars and publishes Tracer/Meter handles to
+/// `observability.global`. Application entry-point code calls
+/// `observability_init.Otel.init` then `installGlobals()` to publish
+/// providers; when `-Dwith_otel=false` this collapses to an empty
+/// struct so the import never resolves the otel namespace.
+pub const observability_init = if (observability.enabled)
+    @import("observability_init")
+else
+    struct {};
+
 inline fn io() std.Io {
     return std.Io.Threaded.global_single_threaded.io();
 }
