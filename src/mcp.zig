@@ -991,6 +991,15 @@ pub const Session = struct {
     }
 
     pub fn request(self: *Session, method: []const u8, params_json: ?[]const u8, timeout_ms: u32) anyerror![]const u8 {
+        // Observability seam: wrap the round-trip in a client-side RPC
+        // span. The seam is null-tracer-safe (no panic when otel isn't
+        // initialized) and the disabled build collapses to a no-op.
+        // The defer is the lifecycle backstop; the success path below
+        // overwrites status to .ok before ending.
+        var __obs_span = observability.startRpcClientSpan(method);
+        defer __obs_span.end(null);
+        errdefer observability.endRpcClientSpan(__obs_span, false, JsonRpcError.InternalError);
+
         const id = self.next_request_id.fetchAdd(1, .monotonic);
 
         var ctx = RequestContext{ .id = id };
@@ -1015,7 +1024,9 @@ pub const Session = struct {
         ctx.done.waitTimeout(io(), .{ .duration = std.Io.Duration.fromNanoseconds(@intCast(timeout_ns)) }) catch return error.Timeout;
 
         if (ctx.err) |e| return e;
-        return ctx.response orelse error.NoResponse;
+        const response = ctx.response orelse return error.NoResponse;
+        observability.endRpcClientSpan(__obs_span, true, 0);
+        return response;
     }
 
     fn buildNotification(self: *Session, method: []const u8, params_json: ?[]const u8) ![]u8 {
@@ -2847,6 +2858,15 @@ pub const Server = struct {
             return @as(?[]const u8, try self.makeErrorResponse(id, JsonRpcError.InvalidRequest, "Missing method"));
         }
 
+        // Observability seam: wrap dispatch in a server-side RPC span.
+        // The seam is null-tracer-safe (no panic when otel isn't
+        // initialized) and the disabled build collapses to a no-op.
+        // The defer is the lifecycle backstop (always ends the span);
+        // the success/failure annotations below set status before end.
+        var __obs_span = observability.startRpcServerSpan(method.?);
+        defer __obs_span.end(null);
+        errdefer observability.endRpcServerSpan(__obs_span, false, JsonRpcError.InternalError);
+
         // Handle the method
         const method_result = self.handleMethod(method.?, params) catch |err| {
             // GAP-031: Use specific error codes based on error type
@@ -2859,6 +2879,7 @@ pub const Server = struct {
                 error.InvalidParams => JsonRpcError.InvalidParams,
                 else => JsonRpcError.InternalError,
             };
+            observability.endRpcServerSpan(__obs_span, false, error_code);
             return @as(?[]const u8, try self.makeErrorResponse(id, error_code, @errorName(err)));
         };
 
@@ -2870,6 +2891,7 @@ pub const Server = struct {
                     self.allocator.free(r);
                 }
             }
+            observability.endRpcServerSpan(__obs_span, true, 0);
             return null;
         }
 
@@ -2883,6 +2905,7 @@ pub const Server = struct {
             }
         }
 
+        observability.endRpcServerSpan(__obs_span, true, 0);
         return @as(?[]const u8, response);
     }
 
