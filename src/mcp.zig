@@ -24,6 +24,13 @@ const ArenaAllocator = std.heap.ArenaAllocator;
 /// fan-out). Re-exported for downstream consumers.
 pub const parallel = @import("parallel.zig");
 
+/// Observability seam (otel). The seam is always compiled, but its
+/// `enabled` flag tracks `-Dwith_otel`; when off, every call collapses
+/// to a comptime-known no-op (verified by the disabled-mode test under
+/// tests/observability_disabled_test.zig). Imported as a named module
+/// so it lives in a single module tree across all consumers.
+pub const observability = @import("observability");
+
 inline fn io() std.Io {
     return std.Io.Threaded.global_single_threaded.io();
 }

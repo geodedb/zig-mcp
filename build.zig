@@ -10,6 +10,43 @@ pub fn build(b: *std.Build) void {
     // Thread-pool parallelism option
     const enable_tp = b.option(bool, "thread-pool", "Enable thread-pool-based parallelism") orelse true;
 
+    // -Dwith_otel: compile in otel instrumentation. OFF by default;
+    // when off the otel dependency is never resolved and the seam
+    // collapses to a comptime-known no-op (verified by
+    // otel/scripts/verify-consumer-noop.sh).
+    const with_otel = b.option(
+        bool,
+        "with_otel",
+        "Compile in otel instrumentation (off by default; zero overhead when off)",
+    ) orelse false;
+
+    // SHARED `build_options` module. Every consumer of the
+    // `observability` seam imports the SAME module instance via
+    // `addImport` so Zig 0.16's "file exists in modules X and X0"
+    // diagnostic doesn't trip when two independent `addOptions` modules
+    // would otherwise share a transitive file path.
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "with_otel", with_otel);
+    const build_options_mod = build_options.createModule();
+
+    // Observability seam (otel). Declared as a SHARED NAMED MODULE so
+    // every consumer (mcp lib + tests) resolves to the same source file
+    // via `@import("observability")`. Using a relative
+    // `@import("observability.zig")` from each module would trip Zig's
+    // "file exists in modules X and Y" error because the file would be
+    // pulled into multiple module trees. The seam's `enabled` flag
+    // tracks `build_options.with_otel`; when off, every helper compiles
+    // to a comptime-known no-op and the otel dependency is never
+    // resolved. The optional `otel` import is wired below inside the
+    // `if (with_otel)` block.
+    const observability_mod = b.addModule("observability", .{
+        .root_source_file = b.path("src/observability.zig"),
+        .target = target,
+        .imports = &.{
+            .{ .name = "build_options", .module = build_options_mod },
+        },
+    });
+
     // Get thread_pool dependency if enabled
     const tp_mod: ?*std.Build.Module = if (enable_tp) blk: {
         const tp_dep = b.dependency("thread_pool", .{
@@ -84,6 +121,12 @@ pub fn build(b: *std.Build) void {
     });
     if (json_mod) |m| mcp_mod.addImport("json", m);
     if (tp_mod) |tm| mcp_mod.addImport("thread_pool", tm);
+    // Observability seam: wire the named `observability` module onto
+    // the public `mcp` module so consumers reach the seam through
+    // `mcp.observability`. The seam itself is comptime-gated by
+    // `build_options.with_otel` and collapses to a no-op when off.
+    mcp_mod.addImport("observability", observability_mod);
+    mcp_mod.addImport("build_options", build_options_mod);
 
     // Server extensions module
     const server_ext_mod = b.addModule("server_ext", .{
@@ -218,6 +261,11 @@ pub fn build(b: *std.Build) void {
     });
     if (json_mod) |m| unit_test_mod.addImport("json", m);
     if (tp_mod) |tm| unit_test_mod.addImport("thread_pool", tm);
+    // Observability seam imports must match `mcp_mod` so the unit-test
+    // root resolves the same `observability` / `build_options` module
+    // instances (avoids "file exists in modules X and X0").
+    unit_test_mod.addImport("observability", observability_mod);
+    unit_test_mod.addImport("build_options", build_options_mod);
     const unit_test = b.addTest(.{
         .root_module = unit_test_mod,
     });
@@ -388,4 +436,46 @@ pub fn build(b: *std.Build) void {
     _ = tls_mod;
     _ = pipelining_mod;
     _ = server_ext_mod;
+
+    // ========================================================================
+    // Observability seam (otel) — gated dep + tests
+    // ========================================================================
+
+    // Gated otel dependency. The `lazy = true` entry in build.zig.zon
+    // means Zig only fetches the package when this branch executes;
+    // with the flag off the dependency is never resolved and the
+    // produced artifacts contain zero otel symbols (verified by
+    // otel/scripts/verify-consumer-noop.sh).
+    if (with_otel) {
+        const otel_dep = b.lazyDependency("otel", .{
+            .target = target,
+            .optimize = optimize,
+        }) orelse return;
+        const otel_module = otel_dep.module("otel");
+        // The seam imports `otel` when enabled. Wire it onto the shared
+        // observability module so every consumer sees the same otel
+        // namespace. Also wire onto the public `mcp` module so callers
+        // who reach for `@import("otel")` directly through `mcp_mod`'s
+        // tree can find it (consistent with dns/grpc-zig).
+        observability_mod.addImport("otel", otel_module);
+        mcp_mod.addImport("otel", otel_module);
+    }
+
+    // Disabled-mode no-op tests. Verifies `build_options.with_otel ==
+    // false` is the default and that the seam's public surface returns
+    // a comptime-known no-op when otel is off. The test is skip-guarded
+    // for the enabled build so it passes under both flag values.
+    const observability_disabled_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/observability_disabled_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "mcp", .module = mcp_mod },
+                .{ .name = "build_options", .module = build_options_mod },
+            },
+        }),
+    });
+    const run_observability_disabled_tests = b.addRunArtifact(observability_disabled_tests);
+    test_step.dependOn(&run_observability_disabled_tests.step);
 }
