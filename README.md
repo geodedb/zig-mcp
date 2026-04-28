@@ -20,7 +20,7 @@ A Zig 0.15.2 implementation of the [Model Context Protocol (MCP)](https://modelc
 
 ## Protocol Version
 
-```
+```text
 2025-03-26
 ```
 
@@ -154,20 +154,24 @@ zig build test-accept
 ## MCP Methods Supported
 
 ### Lifecycle
+
 - `initialize` / `notifications/initialized`
 - `ping`
 - `notifications/cancelled`
 - `notifications/progress`
 
 ### Tools
+
 - `tools/list` (with cursor pagination)
 - `tools/call`
 
 ### Resources
+
 - `resources/list`
 - `resources/read`
 
 ### Tasks
+
 - `tasks/get`
 - `tasks/list` (cursor + limit pagination; returns `nextCursor` when more results are available)
 - `tasks/cancel`
@@ -176,25 +180,30 @@ zig build test-accept
 - `resources/subscribe`
 
 ### Prompts
+
 - `prompts/list`
 - `prompts/get`
 
 ### Logging
+
 - `logging/setLevel`
 - `notifications/message`
 
 ### Completion
+
 - `completion/complete` (ref/prompt + ref/resource, ≤100 results)
 
 ## Authentication
 
 ### Bearer Token
+
 ```zig
 .auth_mode = .bearer,
 .bearer_token = "my-secret-token",
 ```
 
 ### Basic Auth
+
 ```zig
 .auth_mode = .basic,
 .basic_user = "admin",
@@ -202,15 +211,67 @@ zig build test-accept
 ```
 
 ### OAuth2.1
+
 ```zig
 .auth_mode = .oauth2,
 ```
 
 Provides endpoints:
+
 - `/.well-known/oauth-authorization-server`
 - `/mcp/authorize`
 - `/mcp/token`
 - `/mcp/register`
+
+## Observability
+
+Optional OpenTelemetry instrumentation for MCP request/response paths.
+Off by default — when `-Dwith_otel=false` (the default), the otel
+dependency is never fetched and the produced artifacts contain zero
+otel/observability symbols (verified by `verify-consumer-noop.sh` from
+the otel toolchain).
+
+### Build flag
+
+```bash
+zig build -Dwith_otel=true                # compile with otel
+zig build test -Dwith_otel=true           # run smoke test
+zig build                                 # default = disabled, zero overhead
+```
+
+### Spans emitted
+
+Both client (outgoing) and server (incoming) JSON-RPC paths produce
+spans with otel `rpc.*` semantic conventions:
+
+- `rpc.system = "mcp"`
+- `rpc.method = "<json-rpc method>"` (e.g. `"tools/call"`,
+  `"resources/list"`)
+- span kind: `.client` for outbound `Session.request`, `.server` for
+  inbound `Server.processJsonValue`
+- on JSON-RPC errors, `rpc.jsonrpc.error_code` is attached and span
+  status is set to `error`
+
+### Bootstrap
+
+```zig
+const std = @import("std");
+const mcp = @import("mcp");
+
+pub fn main() !void {
+    var otel = try mcp.observability_init.Otel.init(allocator, "my-service");
+    defer otel.deinit();
+    otel.installGlobals();
+    // ... your MCP server / client ...
+}
+```
+
+`OTEL_*` env vars (e.g. `OTEL_SERVICE_NAME`, `OTEL_EXPORTER_OTLP_ENDPOINT`,
+`OTEL_TRACES_SAMPLER`) are honoured by the bootstrap helper. Telemetry
+is non-fatal: a failing exporter never breaks MCP traffic.
+
+For full integration details see the otel rollout recipe at
+`devnw/zig/otel/docs/integration/RECIPE.md`.
 
 ## License
 
