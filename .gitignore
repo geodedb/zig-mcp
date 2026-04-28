@@ -17,3 +17,6 @@ Thumbs.db
 
 # Test outputs
 *.log
+
+# Local git worktrees (per-feature isolated checkouts)
+.worktrees/
