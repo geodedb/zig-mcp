@@ -5,16 +5,16 @@
     .minimum_zig_version = "0.15.0",
     .dependencies = .{
         .json = .{
-            .url = "git+https://gitlab.com/devnw/zig/json.git#v0.1.4",
-            .hash = "json-0.1.4-tOue4X2pCwC2H64hrrIwVKj76kiuJFGAzVqsWjROghkg",
+            .url = "git+https://gitlab.com/devnw/zig/json.git#96592a8ae25f1d91df83022820c86ddb35c326bb",
+            .hash = "json-0.1.4-tOue4Z-pCwC-u6tE4-gUm4rocTBoF41SiKsSHNiKPrXr",
         },
         .thread_pool = .{
             .url = "git+https://gitlab.com/devnw/zig/thread-pool.git#39528a3e92212efab8ed5840bc20e619a419c0f5",
             .hash = "thread_pool-0.2.4-11B1BnyUdgCUNlqgBwHNvE4plLwP1s1MAyCjODPafrpo",
         },
         .otel = .{
-            .url = "git+https://gitlab.com/devnw/zig/otel.git#v0.1.5",
-            .hash = "otel-0.1.5-B0v3lrgLNACao6o8I6edI_sVKYHDsS69B6e9WJailgkS",
+            .url = "git+https://gitlab.com/devnw/zig/otel.git#cd553d7f14a14022846effc85cab8d5f286ddc0f",
+            .hash = "otel-0.1.5-B0v3luELNADeZkDRvx4omSRcxZbqIobqSM6hvFiC05PQ",
             .lazy = true,
         },
     },
