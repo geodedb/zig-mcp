@@ -674,8 +674,8 @@ pub fn generateWebSocketAcceptKey(client_key: []const u8) ![28]u8 {
     const magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
     // Concatenate client key with magic GUID
-    // fips-exempt path: only compiled when fips_enabled == false (see the
-    // @compileError guard above).
+    // fips-exempt: non-security — WebSocket Sec-WebSocket-Accept SHA-1 (RFC 6455
+    // handshake magic); non-fips path only, @compileError'd under -Dfips=true above.
     var hasher = std.crypto.hash.Sha1.init(.{});
     hasher.update(client_key);
     hasher.update(magic);
