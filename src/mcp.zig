@@ -42,6 +42,10 @@ pub const observability_init = if (observability.enabled)
 else
     struct {};
 
+test {
+    _ = @import("crypto_backend_smoke_test.zig");
+}
+
 inline fn io() std.Io {
     return std.Io.Threaded.global_single_threaded.io();
 }

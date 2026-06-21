@@ -25,9 +25,40 @@ pub fn build(b: *std.Build) void {
     // `addImport` so Zig 0.16's "file exists in modules X and X0"
     // diagnostic doesn't trip when two independent `addOptions` modules
     // would otherwise share a transitive file path.
+    // -Dfips: route security crypto through the linked OpenSSL FIPS-140-3
+    // provider. OFF by default with zero overhead; the lazy `fips` dependency
+    // is resolved only when this is true.
+    const fips = b.option(bool, "fips", "Route security crypto through the linked FIPS-140-3 provider (off by default; zero overhead when off)") orelse false;
+    const openssl_path = b.option([]const u8, "openssl_path", "OpenSSL install prefix for non-standard installs (e.g. /usr/local/ssl)");
+    const link = @import("src/link.zig");
+
     const build_options = b.addOptions();
     build_options.addOption(bool, "with_otel", with_otel);
+    build_options.addOption(bool, "fips", fips);
     const build_options_mod = build_options.createModule();
+
+    // FIPS seam — SHARED NAMED `crypto_backend` module on the SAME single
+    // `build_options` instance as the otel seam (GAP-0020-safe). The lazy
+    // `fips` dep + OpenSSL link are pulled only when -Dfips=true.
+    const crypto_backend_mod = b.addModule("crypto_backend", .{
+        .root_source_file = b.path("src/crypto_backend.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "build_options", .module = build_options_mod }},
+    });
+    const std_shim_mod = b.addModule("std_shim", .{
+        .root_source_file = b.path("src/std_shim.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    crypto_backend_mod.addImport("std_shim", std_shim_mod);
+    if (fips) {
+        if (b.lazyDependency("fips", .{ .target = target, .optimize = optimize, .openssl_path = openssl_path orelse "/usr/local/ssl" })) |fips_dep| {
+            const fm = fips_dep.module("fips");
+            crypto_backend_mod.addImport("fips", fm);
+            link.linkOpenssl(b, fm, openssl_path);
+        }
+    }
 
     // Observability seam (otel). Declared as a SHARED NAMED MODULE so
     // every consumer (mcp lib + tests) resolves to the same source file
@@ -127,6 +158,7 @@ pub fn build(b: *std.Build) void {
     // `build_options.with_otel` and collapses to a no-op when off.
     mcp_mod.addImport("observability", observability_mod);
     mcp_mod.addImport("build_options", build_options_mod);
+    mcp_mod.addImport("crypto_backend", crypto_backend_mod);
 
     // Server extensions module
     const server_ext_mod = b.addModule("server_ext", .{
@@ -136,6 +168,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "mcp", .module = mcp_mod },
             .{ .name = "log", .module = log_mod },
+            .{ .name = "crypto_backend", .module = crypto_backend_mod },
         },
     });
 
@@ -266,6 +299,7 @@ pub fn build(b: *std.Build) void {
     // instances (avoids "file exists in modules X and X0").
     unit_test_mod.addImport("observability", observability_mod);
     unit_test_mod.addImport("build_options", build_options_mod);
+    unit_test_mod.addImport("crypto_backend", crypto_backend_mod);
     const unit_test = b.addTest(.{
         .root_module = unit_test_mod,
     });
@@ -289,6 +323,9 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/tls.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{
+                .{ .name = "crypto_backend", .module = crypto_backend_mod },
+            },
         }),
     });
     const run_tls_test = b.addRunArtifact(tls_test);
