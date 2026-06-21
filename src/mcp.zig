@@ -17,6 +17,7 @@
 const std = @import("std");
 const json = @import("json");
 const tp = @import("thread_pool");
+const crypto_backend = @import("crypto_backend");
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 
@@ -44,6 +45,18 @@ else
 
 test {
     _ = @import("crypto_backend_smoke_test.zig");
+}
+
+test "FIPS-0008: WebSocket accept-key available only in non-fips builds" {
+    // Under -Dfips the SHA-1 accept-key fn is @compileError'd out; the gated
+    // reference lives in a comptime-pruned block so it is never analyzed.
+    if (crypto_backend.fips_enabled) return error.SkipZigTest;
+    if (!crypto_backend.fips_enabled) {
+        // RFC 6455 §1.3 canonical example:
+        //   key "dGhlIHNhbXBsZSBub25jZQ==" -> "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+        const accept = try generateWebSocketAcceptKey("dGhlIHNhbXBsZSBub25jZQ==");
+        try std.testing.expectEqualStrings("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", &accept);
+    }
 }
 
 inline fn io() std.Io {
@@ -648,11 +661,21 @@ pub const WebSocketConnection = struct {
     }
 };
 
-/// Generate WebSocket accept key from client key (SHA-1 hash per RFC 6455)
+/// Generate WebSocket accept key from client key (SHA-1 hash per RFC 6455).
+///
+/// FIPS-0008: SHA-1 is NOT FIPS-140-3 approved and RFC 6455 mandates it,
+/// so there is no interop-preserving FIPS substitute. Under -Dfips=true
+/// this capability is REMOVED (hard compile error); fips deployments must
+/// front MCP with a TLS-terminating proxy or use a non-WebSocket transport.
 pub fn generateWebSocketAcceptKey(client_key: []const u8) ![28]u8 {
+    if (crypto_backend.fips_enabled) {
+        @compileError("generateWebSocketAcceptKey: SHA-1 WebSocket handshake is not FIPS-140-3 approved and is removed under -Dfips=true (RFC 6455 mandates SHA-1; no approved substitute). Terminate WebSocket/TLS at a validated proxy instead.");
+    }
     const magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
     // Concatenate client key with magic GUID
+    // fips-exempt path: only compiled when fips_enabled == false (see the
+    // @compileError guard above).
     var hasher = std.crypto.hash.Sha1.init(.{});
     hasher.update(client_key);
     hasher.update(magic);

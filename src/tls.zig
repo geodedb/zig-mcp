@@ -5,10 +5,18 @@
 //!
 //! Provides TLS/SSL encryption for HTTP and WebSocket transports.
 //! Uses Zig 0.15's std.crypto.tls module.
+//!
+//! FIPS posture: the stdlib `std.crypto.tls` path is the NON-FIPS transport.
+//! Under -Dfips the FIPS migration target is the validated devnw/tls backend
+//! (which routes TLS 1.3 + AEAD through the OpenSSL FIPS provider). This
+//! migration is tracked in docs/FIPS.md; the stdlib path is left in place for
+//! the non-fips build.
 
 const std = @import("std");
 const net = std.net;
 const crypto = std.crypto;
+// fips-exempt-pending: stdlib TLS; migrate to the validated devnw/tls backend
+// for -Dfips (tracked in docs/FIPS.md).
 const tls = crypto.tls;
 const Allocator = std.mem.Allocator;
 

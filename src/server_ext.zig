@@ -9,6 +9,7 @@
 const std = @import("std");
 const mcp = @import("mcp");
 const log = @import("log");
+const crypto_backend = @import("crypto_backend");
 const Allocator = std.mem.Allocator;
 
 inline fn io() std.Io {
@@ -241,6 +242,15 @@ pub const ExtendedServer = struct {
 
     fn wsConnectionHandler(self: *ExtendedServer, stream: std.Io.net.Stream, config: WebSocketConfig) void {
         _ = config;
+        // FIPS-0008: the WebSocket handshake requires the SHA-1 accept-key,
+        // which is removed under -Dfips=true (generateWebSocketAcceptKey is
+        // @compileError'd out). Comptime-elide the whole handler so no fips
+        // caller references the SHA-1 path. fips deployments must front MCP
+        // with a TLS-terminating proxy or use a non-WebSocket transport.
+        if (comptime crypto_backend.fips_enabled) {
+            streamClose(stream);
+            return;
+        }
         // Perform WebSocket handshake
         var buf: [4096]u8 = undefined;
         const n = streamRead(stream, &buf) catch {
