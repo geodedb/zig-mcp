@@ -54,7 +54,7 @@ pub fn main(init: std.process.Init) !void {
     log.info("Starting MCP server: {s} v{s}", .{ config.name, config.version });
 
     // Create handler (demo implementation)
-    const handler = createDemoHandler();
+    const handler = createDemoHandler(allocator);
 
     // Create server
     var server = try mcp.Server.init(allocator, .{
@@ -145,7 +145,14 @@ fn printUsage() void {
     std.debug.print("{s}", .{usage});
 }
 
-fn createDemoHandler() mcp.Handler {
+/// Allocator `demoCallTool` uses to produce server-owned results, per the
+/// `mcp.Handler.callTool` ownership contract (the server frees the returned
+/// slice with `Server.allocator`). This CLI runs a single server per
+/// process, so a file-level slot set once by `createDemoHandler` is enough.
+var demo_alloc: std.mem.Allocator = std.heap.page_allocator;
+
+fn createDemoHandler(allocator: std.mem.Allocator) mcp.Handler {
+    demo_alloc = allocator;
     return .{
         .listTools = demoListTools,
         .callTool = demoCallTool,
@@ -168,7 +175,9 @@ fn demoListTools(_: ?*anyopaque, _: ?[]const u8) anyerror![]const u8 {
 fn demoCallTool(_: ?*anyopaque, name: []const u8, args: []const u8, _: *const mcp.CancelToken) anyerror![]const u8 {
     _ = name;
     _ = args;
-    return "{\"content\":[{\"type\":\"text\",\"text\":\"Echo: demo response\"}]}";
+    // tools/call results are owned=true at the dispatch site (the server
+    // frees this with demo_alloc) -- must return allocator-owned bytes.
+    return demo_alloc.dupe(u8, "{\"content\":[{\"type\":\"text\",\"text\":\"Echo: demo response\"}]}");
 }
 
 fn demoListResources(_: ?*anyopaque, _: ?[]const u8) anyerror![]const u8 {

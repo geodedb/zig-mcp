@@ -1285,6 +1285,16 @@ const RequestInfo = struct {
 pub const Handler = struct {
     ctx: ?*anyopaque = null,
     listTools: *const fn (ctx: ?*anyopaque, cursor: ?[]const u8) anyerror![]const u8,
+    /// Ownership contract: the server always frees the returned slice with
+    /// the allocator it was constructed with (`Server.allocator`) once the
+    /// JSON-RPC response has been built. Implementations MUST therefore
+    /// return bytes allocated with that same allocator on every call --
+    /// static/comptime string literals are NOT safe to return here (unlike
+    /// e.g. `listTools`/`listResources`, which the server treats as
+    /// possibly-static and never frees). Tool responses are typically
+    /// per-call heap allocations (JSON built from user/tool-supplied data),
+    /// so a long-running server that never frees them leaks for its whole
+    /// lifetime -- see the `tools/call` dispatch site in `handleMethod`.
     callTool: *const fn (ctx: ?*anyopaque, name: []const u8, args_json: []const u8, cancel: *const CancelToken) anyerror![]const u8,
     listResources: *const fn (ctx: ?*anyopaque, cursor: ?[]const u8) anyerror![]const u8,
     readResource: *const fn (ctx: ?*anyopaque, uri: []const u8) anyerror![]const u8,
@@ -2996,7 +3006,12 @@ pub const Server = struct {
 
             var cancel = CancelToken{};
 
-            return .{ .result = try self.handler.callTool(self.handler.ctx, name, args_json, &cancel), .owned = false };
+            // callTool results are always allocator-owned per the Handler.callTool
+            // ownership contract (see doc comment on the field) -- the server frees
+            // this slice below in dispatch(). Fixes a server-lifetime leak: every
+            // dynamically-allocated tool response previously went unfreed because
+            // this dispatch site was hardcoded owned=false.
+            return .{ .result = try self.handler.callTool(self.handler.ctx, name, args_json, &cancel), .owned = true };
         } else if (std.mem.eql(u8, method, "resources/list")) {
             const cursor = self.extractCursor(params);
             return .{ .result = try self.handler.listResources(self.handler.ctx, cursor), .owned = false };
@@ -3587,7 +3602,16 @@ pub const Server = struct {
 // ============================================================================
 
 pub const DemoHandler = struct {
-    pub fn create() Handler {
+    /// Allocator `callTool` uses to produce server-owned results, per the
+    /// `Handler.callTool` ownership contract (the dispatcher always frees
+    /// the returned slice with `Server.allocator`). DemoHandler is a
+    /// process-wide demo/test convenience with no per-instance context, so
+    /// a package-level slot is sufficient -- every caller in this repo
+    /// passes the same allocator instance for the lifetime of one server.
+    var alloc: std.mem.Allocator = std.heap.page_allocator;
+
+    pub fn create(allocator: std.mem.Allocator) Handler {
+        alloc = allocator;
         return .{
             .ctx = null,
             .listTools = listTools,
@@ -3616,7 +3640,10 @@ pub const DemoHandler = struct {
             const result: []const u8 =
                 \\{"content":[{"type":"text","text":"barrier passed"}]}
             ;
-            return result;
+            // tools/call results are owned=true at the dispatch site (the
+            // server frees this with `alloc`) -- must return allocator-owned
+            // bytes, not the static literal above.
+            return alloc.dupe(u8, result);
         }
         return error.ToolNotFound;
     }
@@ -3668,7 +3695,7 @@ test "Server init and deinit" {
     var server = try Server.init(allocator, .{
         .name = "test",
         .version = "1.0.0",
-    }, DemoHandler.create());
+    }, DemoHandler.create(allocator));
     defer server.deinit();
 }
 
@@ -3677,7 +3704,7 @@ test "JSON-RPC parse single request" {
     var server = try Server.init(allocator, .{
         .name = "test",
         .version = "1.0.0",
-    }, DemoHandler.create());
+    }, DemoHandler.create(allocator));
     defer server.deinit();
 
     const request =
@@ -3696,7 +3723,7 @@ test "JSON-RPC parse batch request" {
     var server = try Server.init(allocator, .{
         .name = "test",
         .version = "1.0.0",
-    }, DemoHandler.create());
+    }, DemoHandler.create(allocator));
     defer server.deinit();
 
     const request =
@@ -3715,7 +3742,7 @@ test "Initialize response" {
     var server = try Server.init(allocator, .{
         .name = "test-server",
         .version = "1.0.0",
-    }, DemoHandler.create());
+    }, DemoHandler.create(allocator));
     defer server.deinit();
 
     const request =

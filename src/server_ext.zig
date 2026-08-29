@@ -461,7 +461,7 @@ pub const ExtendedServer = struct {
 test "extended server initialization" {
     const allocator = std.testing.allocator;
 
-    const handler = mcp.DemoHandler.create();
+    const handler = mcp.DemoHandler.create(allocator);
     var server = try ExtendedServer.init(allocator, .{
         .server = .{
             .name = "test-server",
@@ -477,7 +477,7 @@ test "extended server initialization" {
 test "extended server metrics recording" {
     const allocator = std.testing.allocator;
 
-    const handler = mcp.DemoHandler.create();
+    const handler = mcp.DemoHandler.create(allocator);
     var server = try ExtendedServer.init(allocator, .{
         .server = .{
             .name = "test-server",

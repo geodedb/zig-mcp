@@ -71,7 +71,7 @@ test "T1: stdio init+initialized+ping" {
     var server = try mcp.Server.init(allocator, .{
         .name = "test-server",
         .version = "1.0.0",
-    }, mcp.DemoHandler.create());
+    }, mcp.DemoHandler.create(allocator));
     defer server.deinit();
 
     // Send initialize request
@@ -157,7 +157,7 @@ test "T2: stdio batch of 2 pings" {
     var server = try mcp.Server.init(allocator, .{
         .name = "test-server",
         .version = "1.0.0",
-    }, mcp.DemoHandler.create());
+    }, mcp.DemoHandler.create(allocator));
     defer server.deinit();
 
     // Send batch of 2 pings
@@ -217,7 +217,7 @@ test "T3: batch barrier calls prove parallelism" {
         .name = "test-server",
         .version = "1.0.0",
         .worker_threads = 2,
-    }, mcp.DemoHandler.create());
+    }, mcp.DemoHandler.create(allocator));
     defer server.deinit();
 
     // Initialize the server first (required before other requests)
@@ -283,7 +283,7 @@ test "T4: HTTP bearer auth" {
         .auth_mode = .bearer,
         .bearer_token = test_token,
         .http_port = 0, // Let OS assign port
-    }, mcp.DemoHandler.create());
+    }, mcp.DemoHandler.create(allocator));
     defer server.deinit();
 
     const port = try server.serveHttp();
@@ -343,7 +343,7 @@ test "T5: HTTP oauth2 well-known endpoint" {
         .auth_mode = .oauth2,
         .oauth_dynamic_registration = true, // Enable DCR for registration_endpoint
         .http_port = 0,
-    }, mcp.DemoHandler.create());
+    }, mcp.DemoHandler.create(allocator));
     defer server.deinit();
 
     const port = try server.serveHttp();
@@ -407,7 +407,7 @@ test "Notification has no response" {
     var server = try mcp.Server.init(allocator, .{
         .name = "test-server",
         .version = "1.0.0",
-    }, mcp.DemoHandler.create());
+    }, mcp.DemoHandler.create(allocator));
     defer server.deinit();
 
     // Notification (no id field)
@@ -425,7 +425,7 @@ test "Invalid JSON returns parse error" {
     var server = try mcp.Server.init(allocator, .{
         .name = "test-server",
         .version = "1.0.0",
-    }, mcp.DemoHandler.create());
+    }, mcp.DemoHandler.create(allocator));
     defer server.deinit();
 
     const invalid_json = "not valid json at all";
@@ -445,7 +445,7 @@ test "Missing jsonrpc field returns invalid request" {
     var server = try mcp.Server.init(allocator, .{
         .name = "test-server",
         .version = "1.0.0",
-    }, mcp.DemoHandler.create());
+    }, mcp.DemoHandler.create(allocator));
     defer server.deinit();
 
     const bad_request =
@@ -467,7 +467,7 @@ test "String request ID preserved" {
     var server = try mcp.Server.init(allocator, .{
         .name = "test-server",
         .version = "1.0.0",
-    }, mcp.DemoHandler.create());
+    }, mcp.DemoHandler.create(allocator));
     defer server.deinit();
 
     const request =
@@ -487,7 +487,7 @@ test "tools/list returns tools array" {
     var server = try mcp.Server.init(allocator, .{
         .name = "test-server",
         .version = "1.0.0",
-    }, mcp.DemoHandler.create());
+    }, mcp.DemoHandler.create(allocator));
     defer server.deinit();
 
     // Initialize first (required before other requests per GAP-004)
@@ -519,7 +519,7 @@ test "Empty batch returns error" {
     var server = try mcp.Server.init(allocator, .{
         .name = "test-server",
         .version = "1.0.0",
-    }, mcp.DemoHandler.create());
+    }, mcp.DemoHandler.create(allocator));
     defer server.deinit();
 
     const empty_batch = "[]";
@@ -542,7 +542,7 @@ test "Version mismatch returns server version" {
     var server = try mcp.Server.init(allocator, .{
         .name = "test-server",
         .version = "1.0.0",
-    }, mcp.DemoHandler.create());
+    }, mcp.DemoHandler.create(allocator));
     defer server.deinit();
 
     // Send initialize with old/unsupported version
@@ -577,7 +577,7 @@ test "Initialize in batch is rejected" {
     var server = try mcp.Server.init(allocator, .{
         .name = "test-server",
         .version = "1.0.0",
-    }, mcp.DemoHandler.create());
+    }, mcp.DemoHandler.create(allocator));
     defer server.deinit();
 
     // Send initialize as part of a batch (not allowed per spec)
@@ -604,7 +604,7 @@ test "Pre-init request blocking" {
     var server = try mcp.Server.init(allocator, .{
         .name = "test-server",
         .version = "1.0.0",
-    }, mcp.DemoHandler.create());
+    }, mcp.DemoHandler.create(allocator));
     defer server.deinit();
 
     // Try to call tools/list before initialize (should be blocked except ping/initialize)
@@ -627,7 +627,7 @@ test "Ping allowed before init" {
     var server = try mcp.Server.init(allocator, .{
         .name = "test-server",
         .version = "1.0.0",
-    }, mcp.DemoHandler.create());
+    }, mcp.DemoHandler.create(allocator));
     defer server.deinit();
 
     // Ping should work even before initialize
@@ -657,7 +657,7 @@ test "Origin header validation" {
         .version = "1.0.0",
         .http_port = 0,
         .http_allowed_origins = &[_][]const u8{"http://allowed.example.com"},
-    }, mcp.DemoHandler.create());
+    }, mcp.DemoHandler.create(allocator));
     defer server.deinit();
 
     const port = try server.serveHttp();
@@ -709,7 +709,7 @@ test "Session lifecycle - create use delete" {
         .name = "test-server",
         .version = "1.0.0",
         .http_port = 0,
-    }, mcp.DemoHandler.create());
+    }, mcp.DemoHandler.create(allocator));
     defer server.deinit();
 
     const port = try server.serveHttp();
@@ -819,7 +819,7 @@ test "resources/unsubscribe" {
     var server = try mcp.Server.init(allocator, .{
         .name = "test-server",
         .version = "1.0.0",
-    }, mcp.DemoHandler.create());
+    }, mcp.DemoHandler.create(allocator));
     defer server.deinit();
 
     // Initialize first
@@ -862,7 +862,7 @@ test "Specific error codes - resource not found" {
     var server = try mcp.Server.init(allocator, .{
         .name = "test-server",
         .version = "1.0.0",
-    }, mcp.DemoHandler.create());
+    }, mcp.DemoHandler.create(allocator));
     defer server.deinit();
 
     // Initialize first
@@ -894,7 +894,7 @@ test "Specific error codes - method not found" {
     var server = try mcp.Server.init(allocator, .{
         .name = "test-server",
         .version = "1.0.0",
-    }, mcp.DemoHandler.create());
+    }, mcp.DemoHandler.create(allocator));
     defer server.deinit();
 
     // Initialize first so we can test method not found (not pre-init blocking)
@@ -930,7 +930,7 @@ test "MCP-Protocol-Version header in response" {
         .name = "test-server",
         .version = "1.0.0",
         .http_port = 0,
-    }, mcp.DemoHandler.create());
+    }, mcp.DemoHandler.create(allocator));
     defer server.deinit();
 
     const port = try server.serveHttp();
@@ -964,7 +964,7 @@ test "Task lifecycle - create get cancel" {
         .name = "test-server",
         .version = "1.0.0",
         .tasks_enabled = true,
-    }, mcp.DemoHandler.create());
+    }, mcp.DemoHandler.create(allocator));
     defer server.deinit();
 
     // Initialize first
@@ -1002,7 +1002,7 @@ test "tasks/list returns array" {
         .name = "test-server",
         .version = "1.0.0",
         .tasks_enabled = true,
-    }, mcp.DemoHandler.create());
+    }, mcp.DemoHandler.create(allocator));
     defer server.deinit();
 
     // Initialize first
@@ -1042,7 +1042,7 @@ test "Rate limiting rejects excess requests" {
         .version = "1.0.0",
         .rate_limit_requests_per_second = 1,
         .rate_limit_burst = 2,
-    }, mcp.DemoHandler.create());
+    }, mcp.DemoHandler.create(allocator));
     defer server.deinit();
 
     // Send multiple requests quickly
@@ -1074,7 +1074,7 @@ test "Parse sampling.tools capability" {
     var server = try mcp.Server.init(allocator, .{
         .name = "test-server",
         .version = "1.0.0",
-    }, mcp.DemoHandler.create());
+    }, mcp.DemoHandler.create(allocator));
     defer server.deinit();
 
     // Initialize with sampling.tools capability
@@ -1096,7 +1096,7 @@ test "Parse sampling.context capability" {
     var server = try mcp.Server.init(allocator, .{
         .name = "test-server",
         .version = "1.0.0",
-    }, mcp.DemoHandler.create());
+    }, mcp.DemoHandler.create(allocator));
     defer server.deinit();
 
     // Initialize with sampling.context capability
@@ -1118,7 +1118,7 @@ test "Parse elicitation capability" {
     var server = try mcp.Server.init(allocator, .{
         .name = "test-server",
         .version = "1.0.0",
-    }, mcp.DemoHandler.create());
+    }, mcp.DemoHandler.create(allocator));
     defer server.deinit();
 
     // Initialize with elicitation capability
@@ -1145,7 +1145,7 @@ test "batch processing dispatches via thread-pool when pool is set" {
         .name = "test-server",
         .version = "1.0.0",
         .worker_threads = 4,
-    }, mcp.DemoHandler.create());
+    }, mcp.DemoHandler.create(allocator));
     defer server.deinit();
     server.pool = &pool;
 
@@ -1206,7 +1206,7 @@ test "batch processing does not deadlock under pool backpressure" {
         .name = "test-server",
         .version = "1.0.0",
         .worker_threads = 1,
-    }, mcp.DemoHandler.create());
+    }, mcp.DemoHandler.create(allocator));
     defer server.deinit();
     server.pool = &pool;
 
@@ -1254,7 +1254,7 @@ test "startWorkers creates a server-owned thread-pool and deinit destroys it" {
         .name = "test-server",
         .version = "1.0.0",
         .worker_threads = 2,
-    }, mcp.DemoHandler.create());
+    }, mcp.DemoHandler.create(allocator));
     defer server.deinit();
 
     // No pool attached until startWorkers runs.
@@ -1283,7 +1283,7 @@ test "processBatch lazy-creates thread-pool when no pool is attached" {
         .name = "test-server",
         .version = "1.0.0",
         .worker_threads = 2,
-    }, mcp.DemoHandler.create());
+    }, mcp.DemoHandler.create(allocator));
     defer server.deinit();
 
     // No ensureWorkers, no serve* — pool must be null going in.
