@@ -53,8 +53,10 @@ pub fn main(init: std.process.Init) !void {
 
     log.info("Starting MCP server: {s} v{s}", .{ config.name, config.version });
 
-    // Create handler (demo implementation)
-    const handler = createDemoHandler(allocator);
+    // Create handler (demo implementation). `demo_state` must outlive
+    // `server` below since the handler's `ctx` points into it.
+    var demo_state = DemoState{ .allocator = allocator };
+    const handler = createDemoHandler(&demo_state);
 
     // Create server
     var server = try mcp.Server.init(allocator, .{
@@ -145,15 +147,18 @@ fn printUsage() void {
     std.debug.print("{s}", .{usage});
 }
 
-/// Allocator `demoCallTool` uses to produce server-owned results, per the
-/// `mcp.Handler.callTool` ownership contract (the server frees the returned
-/// slice with `Server.allocator`). This CLI runs a single server per
-/// process, so a file-level slot set once by `createDemoHandler` is enough.
-var demo_alloc: std.mem.Allocator = std.heap.page_allocator;
+/// Per-instance demo handler state, threaded through `mcp.Handler.ctx`
+/// rather than a process-wide global. Holds the allocator `demoCallTool`
+/// uses to produce server-owned results, per the `mcp.Handler.callTool`
+/// ownership contract (the server frees the returned slice with
+/// `Server.allocator`).
+const DemoState = struct {
+    allocator: std.mem.Allocator,
+};
 
-fn createDemoHandler(allocator: std.mem.Allocator) mcp.Handler {
-    demo_alloc = allocator;
+fn createDemoHandler(state: *DemoState) mcp.Handler {
     return .{
+        .ctx = @ptrCast(state),
         .listTools = demoListTools,
         .callTool = demoCallTool,
         .listResources = demoListResources,
@@ -172,12 +177,13 @@ fn demoListTools(_: ?*anyopaque, _: ?[]const u8) anyerror![]const u8 {
     return "{\"tools\":[{\"name\":\"echo\",\"description\":\"Echo the input\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"message\":{\"type\":\"string\"}}}}]}";
 }
 
-fn demoCallTool(_: ?*anyopaque, name: []const u8, args: []const u8, _: *const mcp.CancelToken) anyerror![]const u8 {
+fn demoCallTool(ctx: ?*anyopaque, name: []const u8, args: []const u8, _: *const mcp.CancelToken) anyerror![]const u8 {
     _ = name;
     _ = args;
     // tools/call results are owned=true at the dispatch site (the server
-    // frees this with demo_alloc) -- must return allocator-owned bytes.
-    return demo_alloc.dupe(u8, "{\"content\":[{\"type\":\"text\",\"text\":\"Echo: demo response\"}]}");
+    // frees this with state.allocator) -- must return allocator-owned bytes.
+    const state: *DemoState = @ptrCast(@alignCast(ctx.?));
+    return state.allocator.dupe(u8, "{\"content\":[{\"type\":\"text\",\"text\":\"Echo: demo response\"}]}");
 }
 
 fn demoListResources(_: ?*anyopaque, _: ?[]const u8) anyerror![]const u8 {

@@ -14,6 +14,8 @@ This directory contains practical examples demonstrating how to use the MCP (Mod
 | [06_client_example.zig](06_client_example.zig) | Building MCP client requests |
 | [07_notifications.zig](07_notifications.zig) | Server-to-client notifications |
 
+> **⚠️ `tools/call` ownership (since v0.1.12):** the server frees every `callTool` result with its own allocator. Handlers MUST return allocator-owned bytes (e.g. `allocator.dupe(u8, ...)`) — returning a static string literal will be invalid-freed. Examples 01, 02, 05, and 07 still return static literals for brevity and have NOT been updated; copy the allocator-owned pattern from [03_tool_registration.zig](03_tool_registration.zig) instead.
+
 ## Building the Examples
 
 Add the examples to your `build.zig`:
@@ -47,6 +49,7 @@ for (example_names) |name| {
 ```
 
 Then build with:
+
 ```bash
 zig build
 ```
@@ -62,6 +65,7 @@ The simplest MCP server using stdio transport:
 ```
 
 Test with JSON-RPC messages:
+
 ```bash
 echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}' | ./zig-out/bin/01_basic_server
 ```
@@ -75,6 +79,7 @@ HTTP server with SSE support:
 ```
 
 Test with curl:
+
 ```bash
 # Initialize
 curl -X POST http://localhost:8080/mcp \
@@ -97,6 +102,7 @@ Server with stateful tools and cancellation support:
 ```
 
 Demonstrates:
+
 - Using context to pass state to handlers
 - Counter tool that persists across calls
 - Key-value storage tool
@@ -111,6 +117,7 @@ Server demonstrating resources and prompts:
 ```
 
 Demonstrates:
+
 - Static and dynamic resources
 - Resource templates with URI patterns
 - Resource subscriptions
@@ -203,16 +210,19 @@ var server = try mcp.Server.init(allocator, .{
 ### Response Formats
 
 Tools must return content in this format:
+
 ```json
 {"content":[{"type":"text","text":"Result text"}]}
 ```
 
 Resources return:
+
 ```json
 {"contents":[{"uri":"...","mimeType":"...","text":"..."}]}
 ```
 
 Prompts return:
+
 ```json
 {"messages":[{"role":"user","content":{"type":"text","text":"..."}}]}
 ```

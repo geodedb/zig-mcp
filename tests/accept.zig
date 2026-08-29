@@ -68,10 +68,11 @@ fn getStringField(obj: []const json.Member, key: []const u8) ?[]const u8 {
 test "T1: stdio init+initialized+ping" {
     const allocator = std.testing.allocator;
 
+    var demo_handler = mcp.DemoHandler.init(allocator);
     var server = try mcp.Server.init(allocator, .{
         .name = "test-server",
         .version = "1.0.0",
-    }, mcp.DemoHandler.create(allocator));
+    }, demo_handler.handler());
     defer server.deinit();
 
     // Send initialize request
@@ -154,10 +155,11 @@ test "T1: stdio init+initialized+ping" {
 test "T2: stdio batch of 2 pings" {
     const allocator = std.testing.allocator;
 
+    var demo_handler = mcp.DemoHandler.init(allocator);
     var server = try mcp.Server.init(allocator, .{
         .name = "test-server",
         .version = "1.0.0",
-    }, mcp.DemoHandler.create(allocator));
+    }, demo_handler.handler());
     defer server.deinit();
 
     // Send batch of 2 pings
@@ -213,11 +215,12 @@ test "T3: batch barrier calls prove parallelism" {
     const allocator = std.testing.allocator;
 
     // Create server with worker threads for parallel processing
+    var demo_handler = mcp.DemoHandler.init(allocator);
     var server = try mcp.Server.init(allocator, .{
         .name = "test-server",
         .version = "1.0.0",
         .worker_threads = 2,
-    }, mcp.DemoHandler.create(allocator));
+    }, demo_handler.handler());
     defer server.deinit();
 
     // Initialize the server first (required before other requests)
@@ -277,13 +280,14 @@ test "T4: HTTP bearer auth" {
 
     const test_token = "test-bearer-token-12345";
 
+    var demo_handler = mcp.DemoHandler.init(allocator);
     var server = try mcp.Server.init(allocator, .{
         .name = "test-server",
         .version = "1.0.0",
         .auth_mode = .bearer,
         .bearer_token = test_token,
         .http_port = 0, // Let OS assign port
-    }, mcp.DemoHandler.create(allocator));
+    }, demo_handler.handler());
     defer server.deinit();
 
     const port = try server.serveHttp();
@@ -337,13 +341,14 @@ test "T4: HTTP bearer auth" {
 test "T5: HTTP oauth2 well-known endpoint" {
     const allocator = std.testing.allocator;
 
+    var demo_handler = mcp.DemoHandler.init(allocator);
     var server = try mcp.Server.init(allocator, .{
         .name = "test-server",
         .version = "1.0.0",
         .auth_mode = .oauth2,
         .oauth_dynamic_registration = true, // Enable DCR for registration_endpoint
         .http_port = 0,
-    }, mcp.DemoHandler.create(allocator));
+    }, demo_handler.handler());
     defer server.deinit();
 
     const port = try server.serveHttp();
@@ -404,10 +409,11 @@ test "T5: HTTP oauth2 well-known endpoint" {
 test "Notification has no response" {
     const allocator = std.testing.allocator;
 
+    var demo_handler = mcp.DemoHandler.init(allocator);
     var server = try mcp.Server.init(allocator, .{
         .name = "test-server",
         .version = "1.0.0",
-    }, mcp.DemoHandler.create(allocator));
+    }, demo_handler.handler());
     defer server.deinit();
 
     // Notification (no id field)
@@ -422,10 +428,11 @@ test "Notification has no response" {
 test "Invalid JSON returns parse error" {
     const allocator = std.testing.allocator;
 
+    var demo_handler = mcp.DemoHandler.init(allocator);
     var server = try mcp.Server.init(allocator, .{
         .name = "test-server",
         .version = "1.0.0",
-    }, mcp.DemoHandler.create(allocator));
+    }, demo_handler.handler());
     defer server.deinit();
 
     const invalid_json = "not valid json at all";
@@ -442,10 +449,11 @@ test "Invalid JSON returns parse error" {
 test "Missing jsonrpc field returns invalid request" {
     const allocator = std.testing.allocator;
 
+    var demo_handler = mcp.DemoHandler.init(allocator);
     var server = try mcp.Server.init(allocator, .{
         .name = "test-server",
         .version = "1.0.0",
-    }, mcp.DemoHandler.create(allocator));
+    }, demo_handler.handler());
     defer server.deinit();
 
     const bad_request =
@@ -464,10 +472,11 @@ test "Missing jsonrpc field returns invalid request" {
 test "String request ID preserved" {
     const allocator = std.testing.allocator;
 
+    var demo_handler = mcp.DemoHandler.init(allocator);
     var server = try mcp.Server.init(allocator, .{
         .name = "test-server",
         .version = "1.0.0",
-    }, mcp.DemoHandler.create(allocator));
+    }, demo_handler.handler());
     defer server.deinit();
 
     const request =
@@ -484,10 +493,11 @@ test "String request ID preserved" {
 test "tools/list returns tools array" {
     const allocator = std.testing.allocator;
 
+    var demo_handler = mcp.DemoHandler.init(allocator);
     var server = try mcp.Server.init(allocator, .{
         .name = "test-server",
         .version = "1.0.0",
-    }, mcp.DemoHandler.create(allocator));
+    }, demo_handler.handler());
     defer server.deinit();
 
     // Initialize first (required before other requests per GAP-004)
@@ -516,10 +526,11 @@ test "tools/list returns tools array" {
 test "Empty batch returns error" {
     const allocator = std.testing.allocator;
 
+    var demo_handler = mcp.DemoHandler.init(allocator);
     var server = try mcp.Server.init(allocator, .{
         .name = "test-server",
         .version = "1.0.0",
-    }, mcp.DemoHandler.create(allocator));
+    }, demo_handler.handler());
     defer server.deinit();
 
     const empty_batch = "[]";
@@ -539,10 +550,11 @@ test "Empty batch returns error" {
 test "Version mismatch returns server version" {
     const allocator = std.testing.allocator;
 
+    var demo_handler = mcp.DemoHandler.init(allocator);
     var server = try mcp.Server.init(allocator, .{
         .name = "test-server",
         .version = "1.0.0",
-    }, mcp.DemoHandler.create(allocator));
+    }, demo_handler.handler());
     defer server.deinit();
 
     // Send initialize with old/unsupported version
@@ -574,10 +586,11 @@ test "Version mismatch returns server version" {
 test "Initialize in batch is rejected" {
     const allocator = std.testing.allocator;
 
+    var demo_handler = mcp.DemoHandler.init(allocator);
     var server = try mcp.Server.init(allocator, .{
         .name = "test-server",
         .version = "1.0.0",
-    }, mcp.DemoHandler.create(allocator));
+    }, demo_handler.handler());
     defer server.deinit();
 
     // Send initialize as part of a batch (not allowed per spec)
@@ -601,10 +614,11 @@ test "Initialize in batch is rejected" {
 test "Pre-init request blocking" {
     const allocator = std.testing.allocator;
 
+    var demo_handler = mcp.DemoHandler.init(allocator);
     var server = try mcp.Server.init(allocator, .{
         .name = "test-server",
         .version = "1.0.0",
-    }, mcp.DemoHandler.create(allocator));
+    }, demo_handler.handler());
     defer server.deinit();
 
     // Try to call tools/list before initialize (should be blocked except ping/initialize)
@@ -624,10 +638,11 @@ test "Pre-init request blocking" {
 test "Ping allowed before init" {
     const allocator = std.testing.allocator;
 
+    var demo_handler = mcp.DemoHandler.init(allocator);
     var server = try mcp.Server.init(allocator, .{
         .name = "test-server",
         .version = "1.0.0",
-    }, mcp.DemoHandler.create(allocator));
+    }, demo_handler.handler());
     defer server.deinit();
 
     // Ping should work even before initialize
@@ -652,12 +667,13 @@ test "Origin header validation" {
     const allocator = std.testing.allocator;
 
     // Server with explicit allowed origins
+    var demo_handler = mcp.DemoHandler.init(allocator);
     var server = try mcp.Server.init(allocator, .{
         .name = "test-server",
         .version = "1.0.0",
         .http_port = 0,
         .http_allowed_origins = &[_][]const u8{"http://allowed.example.com"},
-    }, mcp.DemoHandler.create(allocator));
+    }, demo_handler.handler());
     defer server.deinit();
 
     const port = try server.serveHttp();
@@ -705,11 +721,12 @@ test "Origin header validation" {
 test "Session lifecycle - create use delete" {
     const allocator = std.testing.allocator;
 
+    var demo_handler = mcp.DemoHandler.init(allocator);
     var server = try mcp.Server.init(allocator, .{
         .name = "test-server",
         .version = "1.0.0",
         .http_port = 0,
-    }, mcp.DemoHandler.create(allocator));
+    }, demo_handler.handler());
     defer server.deinit();
 
     const port = try server.serveHttp();
@@ -816,10 +833,11 @@ test "Session lifecycle - create use delete" {
 test "resources/unsubscribe" {
     const allocator = std.testing.allocator;
 
+    var demo_handler = mcp.DemoHandler.init(allocator);
     var server = try mcp.Server.init(allocator, .{
         .name = "test-server",
         .version = "1.0.0",
-    }, mcp.DemoHandler.create(allocator));
+    }, demo_handler.handler());
     defer server.deinit();
 
     // Initialize first
@@ -859,10 +877,11 @@ test "resources/unsubscribe" {
 test "Specific error codes - resource not found" {
     const allocator = std.testing.allocator;
 
+    var demo_handler = mcp.DemoHandler.init(allocator);
     var server = try mcp.Server.init(allocator, .{
         .name = "test-server",
         .version = "1.0.0",
-    }, mcp.DemoHandler.create(allocator));
+    }, demo_handler.handler());
     defer server.deinit();
 
     // Initialize first
@@ -891,10 +910,11 @@ test "Specific error codes - resource not found" {
 test "Specific error codes - method not found" {
     const allocator = std.testing.allocator;
 
+    var demo_handler = mcp.DemoHandler.init(allocator);
     var server = try mcp.Server.init(allocator, .{
         .name = "test-server",
         .version = "1.0.0",
-    }, mcp.DemoHandler.create(allocator));
+    }, demo_handler.handler());
     defer server.deinit();
 
     // Initialize first so we can test method not found (not pre-init blocking)
@@ -926,11 +946,12 @@ test "Specific error codes - method not found" {
 test "MCP-Protocol-Version header in response" {
     const allocator = std.testing.allocator;
 
+    var demo_handler = mcp.DemoHandler.init(allocator);
     var server = try mcp.Server.init(allocator, .{
         .name = "test-server",
         .version = "1.0.0",
         .http_port = 0,
-    }, mcp.DemoHandler.create(allocator));
+    }, demo_handler.handler());
     defer server.deinit();
 
     const port = try server.serveHttp();
@@ -960,11 +981,12 @@ test "MCP-Protocol-Version header in response" {
 test "Task lifecycle - create get cancel" {
     const allocator = std.testing.allocator;
 
+    var demo_handler = mcp.DemoHandler.init(allocator);
     var server = try mcp.Server.init(allocator, .{
         .name = "test-server",
         .version = "1.0.0",
         .tasks_enabled = true,
-    }, mcp.DemoHandler.create(allocator));
+    }, demo_handler.handler());
     defer server.deinit();
 
     // Initialize first
@@ -998,11 +1020,12 @@ test "Task lifecycle - create get cancel" {
 test "tasks/list returns array" {
     const allocator = std.testing.allocator;
 
+    var demo_handler = mcp.DemoHandler.init(allocator);
     var server = try mcp.Server.init(allocator, .{
         .name = "test-server",
         .version = "1.0.0",
         .tasks_enabled = true,
-    }, mcp.DemoHandler.create(allocator));
+    }, demo_handler.handler());
     defer server.deinit();
 
     // Initialize first
@@ -1037,12 +1060,13 @@ test "Rate limiting rejects excess requests" {
     const allocator = std.testing.allocator;
 
     // Very low rate limit for testing
+    var demo_handler = mcp.DemoHandler.init(allocator);
     var server = try mcp.Server.init(allocator, .{
         .name = "test-server",
         .version = "1.0.0",
         .rate_limit_requests_per_second = 1,
         .rate_limit_burst = 2,
-    }, mcp.DemoHandler.create(allocator));
+    }, demo_handler.handler());
     defer server.deinit();
 
     // Send multiple requests quickly
@@ -1071,10 +1095,11 @@ test "Rate limiting rejects excess requests" {
 test "Parse sampling.tools capability" {
     const allocator = std.testing.allocator;
 
+    var demo_handler = mcp.DemoHandler.init(allocator);
     var server = try mcp.Server.init(allocator, .{
         .name = "test-server",
         .version = "1.0.0",
-    }, mcp.DemoHandler.create(allocator));
+    }, demo_handler.handler());
     defer server.deinit();
 
     // Initialize with sampling.tools capability
@@ -1093,10 +1118,11 @@ test "Parse sampling.tools capability" {
 test "Parse sampling.context capability" {
     const allocator = std.testing.allocator;
 
+    var demo_handler = mcp.DemoHandler.init(allocator);
     var server = try mcp.Server.init(allocator, .{
         .name = "test-server",
         .version = "1.0.0",
-    }, mcp.DemoHandler.create(allocator));
+    }, demo_handler.handler());
     defer server.deinit();
 
     // Initialize with sampling.context capability
@@ -1115,10 +1141,11 @@ test "Parse sampling.context capability" {
 test "Parse elicitation capability" {
     const allocator = std.testing.allocator;
 
+    var demo_handler = mcp.DemoHandler.init(allocator);
     var server = try mcp.Server.init(allocator, .{
         .name = "test-server",
         .version = "1.0.0",
-    }, mcp.DemoHandler.create(allocator));
+    }, demo_handler.handler());
     defer server.deinit();
 
     // Initialize with elicitation capability
@@ -1141,11 +1168,12 @@ test "batch processing dispatches via thread-pool when pool is set" {
     var pool = try tp.ThreadPool.init(allocator, .{ .max_threads = 4 });
     defer pool.deinit();
 
+    var demo_handler = mcp.DemoHandler.init(allocator);
     var server = try mcp.Server.init(allocator, .{
         .name = "test-server",
         .version = "1.0.0",
         .worker_threads = 4,
-    }, mcp.DemoHandler.create(allocator));
+    }, demo_handler.handler());
     defer server.deinit();
     server.pool = &pool;
 
@@ -1202,11 +1230,12 @@ test "batch processing does not deadlock under pool backpressure" {
     });
     defer pool.deinit();
 
+    var demo_handler = mcp.DemoHandler.init(allocator);
     var server = try mcp.Server.init(allocator, .{
         .name = "test-server",
         .version = "1.0.0",
         .worker_threads = 1,
-    }, mcp.DemoHandler.create(allocator));
+    }, demo_handler.handler());
     defer server.deinit();
     server.pool = &pool;
 
@@ -1250,11 +1279,12 @@ test "batch processing does not deadlock under pool backpressure" {
 test "startWorkers creates a server-owned thread-pool and deinit destroys it" {
     const allocator = std.testing.allocator;
 
+    var demo_handler = mcp.DemoHandler.init(allocator);
     var server = try mcp.Server.init(allocator, .{
         .name = "test-server",
         .version = "1.0.0",
         .worker_threads = 2,
-    }, mcp.DemoHandler.create(allocator));
+    }, demo_handler.handler());
     defer server.deinit();
 
     // No pool attached until startWorkers runs.
@@ -1279,11 +1309,12 @@ test "startWorkers creates a server-owned thread-pool and deinit destroys it" {
 test "processBatch lazy-creates thread-pool when no pool is attached" {
     const allocator = std.testing.allocator;
 
+    var demo_handler = mcp.DemoHandler.init(allocator);
     var server = try mcp.Server.init(allocator, .{
         .name = "test-server",
         .version = "1.0.0",
         .worker_threads = 2,
-    }, mcp.DemoHandler.create(allocator));
+    }, demo_handler.handler());
     defer server.deinit();
 
     // No ensureWorkers, no serve* — pool must be null going in.

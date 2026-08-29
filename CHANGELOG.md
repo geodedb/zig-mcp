@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.12] - 2026-08-29
+
+### Fixed
+- `tools/call` results are now freed by the server (`Server.allocator`) after the JSON-RPC response is built, fixing a server-lifetime memory leak — every dynamically allocated tool response previously went unfreed. **Breaking behavior change:** `Handler.callTool` implementations MUST return allocator-owned bytes (e.g. via `allocator.dupe`); returning a static/comptime string literal will now be invalid-freed. `tools/list`, `resources/*`, `prompts/*`, and `completion/complete` are unaffected and still treated as possibly-static.
+
 ## [0.1.0] - 2026-01-24
 
 Initial open source release of the MCP Server Library for Zig.
@@ -75,5 +80,6 @@ Initial open source release of the MCP Server Library for Zig.
 - Gitleaks allowlist configuration for test data
 - Apache-2.0 open source licensing
 
-[Unreleased]: https://gitlab.com/devnw/zig/mcp/-/compare/v0.1.0...HEAD
+[Unreleased]: https://gitlab.com/devnw/zig/mcp/-/compare/v0.1.12...HEAD
+[0.1.12]: https://gitlab.com/devnw/zig/mcp/-/compare/v0.1.0...v0.1.12
 [0.1.0]: https://gitlab.com/devnw/zig/mcp/-/releases/v0.1.0

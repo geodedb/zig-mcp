@@ -3604,16 +3604,23 @@ pub const Server = struct {
 pub const DemoHandler = struct {
     /// Allocator `callTool` uses to produce server-owned results, per the
     /// `Handler.callTool` ownership contract (the dispatcher always frees
-    /// the returned slice with `Server.allocator`). DemoHandler is a
-    /// process-wide demo/test convenience with no per-instance context, so
-    /// a package-level slot is sufficient -- every caller in this repo
-    /// passes the same allocator instance for the lifetime of one server.
-    var alloc: std.mem.Allocator = std.heap.page_allocator;
+    /// the returned slice with `Server.allocator`). Threaded per-instance
+    /// via `Handler.ctx` (see `handler()`) rather than a package-level
+    /// global, so multiple `DemoHandler` instances (e.g. concurrent tests
+    /// or servers in the same process) each carry their own allocator
+    /// instead of racing on shared mutable state.
+    allocator: std.mem.Allocator,
 
-    pub fn create(allocator: std.mem.Allocator) Handler {
-        alloc = allocator;
+    pub fn init(allocator: std.mem.Allocator) DemoHandler {
+        return .{ .allocator = allocator };
+    }
+
+    /// Builds the `Handler` vtable bound to this instance via `ctx`.
+    /// `self` must outlive every use of the returned `Handler` (the same
+    /// requirement as the `ctx` pattern in examples/03_tool_registration.zig).
+    pub fn handler(self: *DemoHandler) Handler {
         return .{
-            .ctx = null,
+            .ctx = @ptrCast(self),
             .listTools = listTools,
             .callTool = callTool,
             .listResources = listResources,
@@ -3635,15 +3642,16 @@ pub const DemoHandler = struct {
         return result;
     }
 
-    fn callTool(_: ?*anyopaque, name: []const u8, _: []const u8, _: *const CancelToken) anyerror![]const u8 {
+    fn callTool(ctx: ?*anyopaque, name: []const u8, _: []const u8, _: *const CancelToken) anyerror![]const u8 {
         if (std.mem.eql(u8, name, "barrier")) {
             const result: []const u8 =
                 \\{"content":[{"type":"text","text":"barrier passed"}]}
             ;
             // tools/call results are owned=true at the dispatch site (the
-            // server frees this with `alloc`) -- must return allocator-owned
-            // bytes, not the static literal above.
-            return alloc.dupe(u8, result);
+            // server frees this with `self.allocator`) -- must return
+            // allocator-owned bytes, not the static literal above.
+            const self: *DemoHandler = @ptrCast(@alignCast(ctx.?));
+            return self.allocator.dupe(u8, result);
         }
         return error.ToolNotFound;
     }
@@ -3692,19 +3700,21 @@ test "CancelToken" {
 
 test "Server init and deinit" {
     const allocator = std.testing.allocator;
+    var demo_handler = DemoHandler.init(allocator);
     var server = try Server.init(allocator, .{
         .name = "test",
         .version = "1.0.0",
-    }, DemoHandler.create(allocator));
+    }, demo_handler.handler());
     defer server.deinit();
 }
 
 test "JSON-RPC parse single request" {
     const allocator = std.testing.allocator;
+    var demo_handler = DemoHandler.init(allocator);
     var server = try Server.init(allocator, .{
         .name = "test",
         .version = "1.0.0",
-    }, DemoHandler.create(allocator));
+    }, demo_handler.handler());
     defer server.deinit();
 
     const request =
@@ -3720,10 +3730,11 @@ test "JSON-RPC parse single request" {
 
 test "JSON-RPC parse batch request" {
     const allocator = std.testing.allocator;
+    var demo_handler = DemoHandler.init(allocator);
     var server = try Server.init(allocator, .{
         .name = "test",
         .version = "1.0.0",
-    }, DemoHandler.create(allocator));
+    }, demo_handler.handler());
     defer server.deinit();
 
     const request =
@@ -3739,10 +3750,11 @@ test "JSON-RPC parse batch request" {
 
 test "Initialize response" {
     const allocator = std.testing.allocator;
+    var demo_handler = DemoHandler.init(allocator);
     var server = try Server.init(allocator, .{
         .name = "test-server",
         .version = "1.0.0",
-    }, DemoHandler.create(allocator));
+    }, demo_handler.handler());
     defer server.deinit();
 
     const request =
