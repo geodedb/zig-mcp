@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.14] - 2026-09-12
+
+### Changed
+
+- Converge thread_pool v0.2.7, fips v0.1.1, protobuf v0.1.5, config v0.1.13 (GAP-0838 diamond sync).
+
+## [0.1.13] - 2026-09-12
+
+### Changed
+
+- Converge thread_pool v0.2.7, fips v0.1.1, protobuf v0.1.5 (GAP-0838 diamond sync).
+
 ## [0.1.12] - 2026-08-29
 
 ### Fixed
@@ -80,6 +92,8 @@ Initial open source release of the MCP Server Library for Zig.
 - Gitleaks allowlist configuration for test data
 - Apache-2.0 open source licensing
 
-[Unreleased]: https://gitlab.com/devnw/zig/mcp/-/compare/v0.1.12...HEAD
+[Unreleased]: https://gitlab.com/devnw/zig/mcp/-/compare/v0.1.14...HEAD
+[0.1.14]: https://gitlab.com/devnw/zig/mcp/-/compare/v0.1.13...v0.1.14
+[0.1.13]: https://gitlab.com/devnw/zig/mcp/-/compare/v0.1.12...v0.1.13
 [0.1.12]: https://gitlab.com/devnw/zig/mcp/-/compare/v0.1.0...v0.1.12
 [0.1.0]: https://gitlab.com/devnw/zig/mcp/-/releases/v0.1.0
