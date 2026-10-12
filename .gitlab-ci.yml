@@ -6,24 +6,44 @@ default:
   tags:
     - company
     - linux
+    - x86
 
 include:
   # Security scanning
   - component: gitlab.com/devnw/ci-catalog/security-sast@v1.55.8
+    inputs:
+      tags: ["company", "linux", "x86"]
   - component: gitlab.com/devnw/ci-catalog/security-dependency-scanning@v1.55.8
+    inputs:
+      tags: ["company", "linux", "x86"]
   - component: gitlab.com/devnw/ci-catalog/security-secrets@v1.55.8
+    inputs:
+      tags: ["company", "linux", "x86"]
   - component: gitlab.com/devnw/ci-catalog/security-gitleaks@v1.55.8
+    inputs:
+      tags: ["company", "linux", "x86"]
 
   # Code quality
   - component: gitlab.com/devnw/ci-catalog/zig-format@v1.55.8
+    inputs:
+      tags: ["company", "linux", "x86"]
 
   # SBOM
   - component: gitlab.com/devnw/ci-catalog/sbom-generate@v1.55.8
+    inputs:
+      tags: ["company", "linux", "x86"]
   - component: gitlab.com/devnw/ci-catalog/sbom-scan@v1.55.8
+    inputs:
+      tags: ["company", "linux", "x86"]
 
   # Release
   - component: gitlab.com/devnw/ci-catalog/release-semantic@v1.55.8
+    inputs:
+      tags: ["company", "linux", "x86"]
+      release_auth: job_token
   - component: gitlab.com/devnw/ci-catalog/zig-version-tag-check@v1.55.8
+    inputs:
+      tags: ["company", "linux", "x86"]
 
 variables:
   ZIG_VERSION: "0.16.0"
@@ -177,12 +197,14 @@ fips-deps:
     # of devnw/zig/fips' script; it fetches/verifies OpenSSL via wget + gpg and
     # installs via sudo, a no-op wrapper as root in the container).
     - apt-get update && apt-get install -y --no-install-recommends build-essential perl curl wget sudo gnupg xz-utils ca-certificates
+    - wget -q https://www.openssl-library.org/source/pubkeys.asc -O /tmp/openssl-pubkeys.asc
+    - gpg --batch --import /tmp/openssl-pubkeys.asc
   script:
     # GitLab artifacts must live under $CI_PROJECT_DIR: /usr/local/ssl cannot
     # be uploaded, so build into a project-relative prefix. OPENSSL_VERSION is
     # pinned because the script's "latest 3.x" resolver no longer finds a 3.x
     # tag now that 4.x is the latest release (same pin as devnw/zig/fts-storage).
-    - OPENSSL_PREFIX="$CI_PROJECT_DIR/.openssl-fips" OPENSSL_VERSION="3.6.3" make deps
+    - OPENSSL_PREFIX="$CI_PROJECT_DIR/.openssl-fips" OPENSSL_VERSION="3.6.5" REQUIRE_GPG=1 make deps
   artifacts:
     paths:
       - .openssl-fips/
@@ -190,6 +212,7 @@ fips-deps:
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_TAG'
 
 test-fips:
   stage: test
@@ -204,3 +227,48 @@ test-fips:
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_TAG'
+
+# SONNY-4778: tools must not redirect Git operations into this worktree.
+hook-env-regression:
+  stage: lint
+  image: python:3.14-slim-bookworm
+  tags: [company, linux, x86]
+  before_script:
+    - apt-get update -qq && apt-get install -y --no-install-recommends git
+  script:
+    - python3 scripts/test_hook_env.py
+
+test-source-package:
+  stage: test
+  image: debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f
+  tags: [company, linux, x86]
+  before_script:
+    - *install-zig
+    - apt-get install -y --no-install-recommends git
+  script:
+    - python3 scripts/check_source_package.py --jobs 2
+  needs:
+    - build
+  allow_failure: false
+
+release-signature-regression:
+  stage: lint
+  image: python:3.14-slim-bookworm
+  tags: [company, linux, x86]
+  before_script:
+    - apt-get update -qq && apt-get install -y --no-install-recommends gnupg
+  script:
+    - python3 scripts/test_release_signature.py
+
+# SONNY-4872: exercise actual enabled instrumentation as well as the default.
+test-with-otel:
+  stage: test
+  image: debian:bookworm-slim
+  before_script:
+    - *install-zig
+  script:
+    - zig build test -Dwith_otel=true -j2 --summary all
+  needs:
+    - build
+  allow_failure: false

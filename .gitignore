@@ -23,3 +23,5 @@ Thumbs.db
 
 # OpenSSL FIPS build from `make deps` in CI (project-relative prefix)
 .openssl-fips/
+
+!scripts/test_release_signature.py
