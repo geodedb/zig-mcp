@@ -99,6 +99,11 @@ stages:
   - export PATH="$PWD/zig-${ZIG_VERSION}:$PATH"
   - zig version
 
+# SONNY-4910: exact public-signer exceptions must keep negative controls blocked.
+security-gitleaks:
+  before_script:
+    - sh scripts/test_gitleaks_allowlist.sh
+
 # Override zig-format component to use the project's ZIG_VERSION.
 # The v1.2.1 component defaults to 0.14.0 and does not accept a version input.
 zig-format:
