@@ -29,6 +29,17 @@
 const std = @import("std");
 const mcp = @import("mcp");
 
+/// The server frees every slice a handler callback returns, using the
+/// allocator the server was built with (see "Result Ownership" on
+/// `mcp.Handler`). Callbacks therefore return copies made with that same
+/// allocator, never string literals. `main` sets this before serving.
+var result_allocator: std.mem.Allocator = undefined;
+
+/// Returns a server-owned copy of `text`.
+fn owned(text: []const u8) ![]const u8 {
+    return result_allocator.dupe(u8, text);
+}
+
 /// Example 1: Bearer Token Authentication
 /// The simplest form of authentication - client sends a token in the Authorization header
 fn runBearerServer(allocator: std.mem.Allocator) !void {
@@ -124,6 +135,7 @@ fn runOAuthServer(allocator: std.mem.Allocator) !void {
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
+    result_allocator = allocator;
 
     // Parse command line to determine which auth mode to demo
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
@@ -184,22 +196,22 @@ fn createMinimalHandler() mcp.Handler {
 }
 
 fn listTools(_: ?*anyopaque, _: ?[]const u8) anyerror![]const u8 {
-    return
-    \\{"tools":[{"name":"whoami","description":"Returns information about the authenticated session","inputSchema":{"type":"object","properties":{}}}]}
-    ;
+    return owned(
+        \\{"tools":[{"name":"whoami","description":"Returns information about the authenticated session","inputSchema":{"type":"object","properties":{}}}]}
+    );
 }
 
 fn callTool(_: ?*anyopaque, name: []const u8, _: []const u8, _: *const mcp.CancelToken) anyerror![]const u8 {
     if (std.mem.eql(u8, name, "whoami")) {
-        return
-        \\{"content":[{"type":"text","text":"You are authenticated! Session info would appear here."}]}
-        ;
+        return owned(
+            \\{"content":[{"type":"text","text":"You are authenticated! Session info would appear here."}]}
+        );
     }
     return error.ToolNotFound;
 }
 
 fn listResources(_: ?*anyopaque, _: ?[]const u8) anyerror![]const u8 {
-    return "{\"resources\":[]}";
+    return owned("{\"resources\":[]}");
 }
 
 fn readResource(_: ?*anyopaque, _: []const u8) anyerror![]const u8 {
@@ -207,14 +219,14 @@ fn readResource(_: ?*anyopaque, _: []const u8) anyerror![]const u8 {
 }
 
 fn listResourceTemplates(_: ?*anyopaque) anyerror![]const u8 {
-    return "{\"resourceTemplates\":[]}";
+    return owned("{\"resourceTemplates\":[]}");
 }
 
 fn subscribeResource(_: ?*anyopaque, _: []const u8) anyerror!void {}
 fn unsubscribeResource(_: ?*anyopaque, _: []const u8) anyerror!void {}
 
 fn listPrompts(_: ?*anyopaque, _: ?[]const u8) anyerror![]const u8 {
-    return "{\"prompts\":[]}";
+    return owned("{\"prompts\":[]}");
 }
 
 fn getPrompt(_: ?*anyopaque, _: []const u8, _: ?[]const u8) anyerror![]const u8 {
@@ -222,7 +234,7 @@ fn getPrompt(_: ?*anyopaque, _: []const u8, _: ?[]const u8) anyerror![]const u8 
 }
 
 fn complete(_: ?*anyopaque, _: []const u8) anyerror![]const u8 {
-    return "{\"completion\":{\"values\":[]}}";
+    return owned("{\"completion\":{\"values\":[]}}");
 }
 
 fn setLogLevel(_: ?*anyopaque, _: []const u8) anyerror!void {}

@@ -131,6 +131,18 @@ pub const Server = struct {
 };
 ```
 
+### Handler result ownership
+
+Every `Handler` callback that returns `[]const u8` (`listTools`, `callTool`,
+`listResources`, `readResource`, `listResourceTemplates`, `listPrompts`,
+`getPrompt`, `complete`) hands the slice to the server, which frees it with
+the allocator passed to `Server.init` after the response is built (also for
+notifications and when building the response fails). Return bytes allocated
+with that allocator, never a string literal or a slice the handler keeps:
+`return allocator.dupe(u8, "{\"tools\":[]}");`. A callback that returns an
+error hands nothing over. Versions 0.1.12 to 0.1.21 freed only `callTool`
+results (and leaked the others); see CHANGELOG.md.
+
 ## Testing
 
 ```bash

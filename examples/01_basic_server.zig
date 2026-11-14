@@ -18,6 +18,17 @@
 const std = @import("std");
 const mcp = @import("mcp");
 
+/// The server frees every slice a handler callback returns, using the
+/// allocator the server was built with (see "Result Ownership" on
+/// `mcp.Handler`). Callbacks therefore return copies made with that same
+/// allocator, never string literals. `main` sets this before serving.
+var result_allocator: std.mem.Allocator = undefined;
+
+/// Returns a server-owned copy of `text`.
+fn owned(text: []const u8) ![]const u8 {
+    return result_allocator.dupe(u8, text);
+}
+
 pub fn main() !void {
     // Step 1: Create an allocator
     // The DebugAllocator is suitable for most use cases.
@@ -26,6 +37,7 @@ pub fn main() !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
+    result_allocator = allocator;
 
     // Step 2: Create the handler that defines server behavior
     // The handler contains callbacks for all MCP operations:
@@ -105,24 +117,24 @@ fn listTools(_: ?*anyopaque, cursor: ?[]const u8) anyerror![]const u8 {
     // - name: Unique identifier for the tool
     // - description: Human-readable description for the LLM
     // - inputSchema: JSON Schema describing the expected arguments
-    return
-    \\{"tools":[
-    \\  {
-    \\    "name": "echo",
-    \\    "description": "Echoes back the provided message. Use this to test the server connection.",
-    \\    "inputSchema": {
-    \\      "type": "object",
-    \\      "properties": {
-    \\        "message": {
-    \\          "type": "string",
-    \\          "description": "The message to echo back"
-    \\        }
-    \\      },
-    \\      "required": ["message"]
-    \\    }
-    \\  }
-    \\]}
-    ;
+    return owned(
+        \\{"tools":[
+        \\  {
+        \\    "name": "echo",
+        \\    "description": "Echoes back the provided message. Use this to test the server connection.",
+        \\    "inputSchema": {
+        \\      "type": "object",
+        \\      "properties": {
+        \\        "message": {
+        \\          "type": "string",
+        \\          "description": "The message to echo back"
+        \\        }
+        \\      },
+        \\      "required": ["message"]
+        \\    }
+        \\  }
+        \\]}
+    );
 }
 
 /// Executes a tool call
@@ -157,9 +169,9 @@ fn handleEcho(args_json: []const u8) ![]const u8 {
     // Each content item has a "type" field (text, image, resource, etc.)
     _ = args_json;
 
-    return
-    \\{"content":[{"type":"text","text":"Echo: Message received!"}]}
-    ;
+    return owned(
+        \\{"content":[{"type":"text","text":"Echo: Message received!"}]}
+    );
 }
 
 // ============================================================================
@@ -167,7 +179,7 @@ fn handleEcho(args_json: []const u8) ![]const u8 {
 // ============================================================================
 
 fn listResources(_: ?*anyopaque, _: ?[]const u8) anyerror![]const u8 {
-    return "{\"resources\":[]}";
+    return owned("{\"resources\":[]}");
 }
 
 fn readResource(_: ?*anyopaque, _: []const u8) anyerror![]const u8 {
@@ -175,14 +187,14 @@ fn readResource(_: ?*anyopaque, _: []const u8) anyerror![]const u8 {
 }
 
 fn listResourceTemplates(_: ?*anyopaque) anyerror![]const u8 {
-    return "{\"resourceTemplates\":[]}";
+    return owned("{\"resourceTemplates\":[]}");
 }
 
 fn subscribeResource(_: ?*anyopaque, _: []const u8) anyerror!void {}
 fn unsubscribeResource(_: ?*anyopaque, _: []const u8) anyerror!void {}
 
 fn listPrompts(_: ?*anyopaque, _: ?[]const u8) anyerror![]const u8 {
-    return "{\"prompts\":[]}";
+    return owned("{\"prompts\":[]}");
 }
 
 fn getPrompt(_: ?*anyopaque, _: []const u8, _: ?[]const u8) anyerror![]const u8 {
@@ -190,7 +202,7 @@ fn getPrompt(_: ?*anyopaque, _: []const u8, _: ?[]const u8) anyerror![]const u8 
 }
 
 fn complete(_: ?*anyopaque, _: []const u8) anyerror![]const u8 {
-    return "{\"completion\":{\"values\":[]}}";
+    return owned("{\"completion\":{\"values\":[]}}");
 }
 
 fn setLogLevel(_: ?*anyopaque, _: []const u8) anyerror!void {}

@@ -148,9 +148,9 @@ fn printUsage() void {
 }
 
 /// Per-instance demo handler state, threaded through `mcp.Handler.ctx`
-/// rather than a process-wide global. Holds the allocator `demoCallTool`
-/// uses to produce server-owned results, per the `mcp.Handler.callTool`
-/// ownership contract (the server frees the returned slice with
+/// rather than a process-wide global. Holds the allocator the demo callbacks
+/// use to produce server-owned results, per the `mcp.Handler` "Result
+/// Ownership" contract (the server frees every returned slice with
 /// `Server.allocator`).
 const DemoState = struct {
     allocator: std.mem.Allocator,
@@ -173,45 +173,48 @@ fn createDemoHandler(state: *DemoState) mcp.Handler {
     };
 }
 
-fn demoListTools(_: ?*anyopaque, _: ?[]const u8) anyerror![]const u8 {
-    return "{\"tools\":[{\"name\":\"echo\",\"description\":\"Echo the input\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"message\":{\"type\":\"string\"}}}}]}";
+/// Returns a server-owned copy of `text` (see `DemoState`).
+fn demoOwned(ctx: ?*anyopaque, text: []const u8) ![]const u8 {
+    const state: *DemoState = @ptrCast(@alignCast(ctx.?));
+    return state.allocator.dupe(u8, text);
+}
+
+fn demoListTools(ctx: ?*anyopaque, _: ?[]const u8) anyerror![]const u8 {
+    return demoOwned(ctx, "{\"tools\":[{\"name\":\"echo\",\"description\":\"Echo the input\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"message\":{\"type\":\"string\"}}}}]}");
 }
 
 fn demoCallTool(ctx: ?*anyopaque, name: []const u8, args: []const u8, _: *const mcp.CancelToken) anyerror![]const u8 {
     _ = name;
     _ = args;
-    // tools/call results are owned=true at the dispatch site (the server
-    // frees this with state.allocator) -- must return allocator-owned bytes.
-    const state: *DemoState = @ptrCast(@alignCast(ctx.?));
-    return state.allocator.dupe(u8, "{\"content\":[{\"type\":\"text\",\"text\":\"Echo: demo response\"}]}");
+    return demoOwned(ctx, "{\"content\":[{\"type\":\"text\",\"text\":\"Echo: demo response\"}]}");
 }
 
-fn demoListResources(_: ?*anyopaque, _: ?[]const u8) anyerror![]const u8 {
-    return "{\"resources\":[]}";
+fn demoListResources(ctx: ?*anyopaque, _: ?[]const u8) anyerror![]const u8 {
+    return demoOwned(ctx, "{\"resources\":[]}");
 }
 
-fn demoReadResource(_: ?*anyopaque, _: []const u8) anyerror![]const u8 {
-    return "{\"contents\":[{\"type\":\"text\",\"text\":\"Resource content\"}]}";
+fn demoReadResource(ctx: ?*anyopaque, _: []const u8) anyerror![]const u8 {
+    return demoOwned(ctx, "{\"contents\":[{\"type\":\"text\",\"text\":\"Resource content\"}]}");
 }
 
-fn demoListResourceTemplates(_: ?*anyopaque) anyerror![]const u8 {
-    return "{\"resourceTemplates\":[]}";
+fn demoListResourceTemplates(ctx: ?*anyopaque) anyerror![]const u8 {
+    return demoOwned(ctx, "{\"resourceTemplates\":[]}");
 }
 
 fn demoSubscribeResource(_: ?*anyopaque, _: []const u8) anyerror!void {}
 
 fn demoUnsubscribeResource(_: ?*anyopaque, _: []const u8) anyerror!void {}
 
-fn demoListPrompts(_: ?*anyopaque, _: ?[]const u8) anyerror![]const u8 {
-    return "{\"prompts\":[]}";
+fn demoListPrompts(ctx: ?*anyopaque, _: ?[]const u8) anyerror![]const u8 {
+    return demoOwned(ctx, "{\"prompts\":[]}");
 }
 
-fn demoGetPrompt(_: ?*anyopaque, _: []const u8, _: ?[]const u8) anyerror![]const u8 {
-    return "{\"messages\":[]}";
+fn demoGetPrompt(ctx: ?*anyopaque, _: []const u8, _: ?[]const u8) anyerror![]const u8 {
+    return demoOwned(ctx, "{\"messages\":[]}");
 }
 
-fn demoComplete(_: ?*anyopaque, _: []const u8) anyerror![]const u8 {
-    return "{\"completion\":{\"values\":[]}}";
+fn demoComplete(ctx: ?*anyopaque, _: []const u8) anyerror![]const u8 {
+    return demoOwned(ctx, "{\"completion\":{\"values\":[]}}");
 }
 
 fn demoSetLogLevel(_: ?*anyopaque, _: []const u8) anyerror!void {}
