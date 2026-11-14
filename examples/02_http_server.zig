@@ -25,10 +25,22 @@
 const std = @import("std");
 const mcp = @import("mcp");
 
+/// The server frees every slice a handler callback returns, using the
+/// allocator the server was built with (see "Result Ownership" on
+/// `mcp.Handler`). Callbacks therefore return copies made with that same
+/// allocator, never string literals. `main` sets this before serving.
+var result_allocator: std.mem.Allocator = undefined;
+
+/// Returns a server-owned copy of `text`.
+fn owned(text: []const u8) ![]const u8 {
+    return result_allocator.dupe(u8, text);
+}
+
 pub fn main() !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
+    result_allocator = allocator;
 
     const handler = createHandler();
 
@@ -103,51 +115,51 @@ fn createHandler() mcp.Handler {
 
 fn listTools(_: ?*anyopaque, _: ?[]const u8) anyerror![]const u8 {
     // Multiple tools demonstrating different capabilities
-    return
-    \\{"tools":[
-    \\  {
-    \\    "name": "calculator",
-    \\    "description": "Performs basic arithmetic operations",
-    \\    "inputSchema": {
-    \\      "type": "object",
-    \\      "properties": {
-    \\        "operation": {
-    \\          "type": "string",
-    \\          "enum": ["add", "subtract", "multiply", "divide"],
-    \\          "description": "The operation to perform"
-    \\        },
-    \\        "a": { "type": "number", "description": "First operand" },
-    \\        "b": { "type": "number", "description": "Second operand" }
-    \\      },
-    \\      "required": ["operation", "a", "b"]
-    \\    }
-    \\  },
-    \\  {
-    \\    "name": "greeting",
-    \\    "description": "Generates a personalized greeting",
-    \\    "inputSchema": {
-    \\      "type": "object",
-    \\      "properties": {
-    \\        "name": { "type": "string", "description": "Name to greet" },
-    \\        "style": {
-    \\          "type": "string",
-    \\          "enum": ["formal", "casual", "enthusiastic"],
-    \\          "default": "casual"
-    \\        }
-    \\      },
-    \\      "required": ["name"]
-    \\    }
-    \\  },
-    \\  {
-    \\    "name": "timestamp",
-    \\    "description": "Returns the current server timestamp",
-    \\    "inputSchema": {
-    \\      "type": "object",
-    \\      "properties": {}
-    \\    }
-    \\  }
-    \\]}
-    ;
+    return owned(
+        \\{"tools":[
+        \\  {
+        \\    "name": "calculator",
+        \\    "description": "Performs basic arithmetic operations",
+        \\    "inputSchema": {
+        \\      "type": "object",
+        \\      "properties": {
+        \\        "operation": {
+        \\          "type": "string",
+        \\          "enum": ["add", "subtract", "multiply", "divide"],
+        \\          "description": "The operation to perform"
+        \\        },
+        \\        "a": { "type": "number", "description": "First operand" },
+        \\        "b": { "type": "number", "description": "Second operand" }
+        \\      },
+        \\      "required": ["operation", "a", "b"]
+        \\    }
+        \\  },
+        \\  {
+        \\    "name": "greeting",
+        \\    "description": "Generates a personalized greeting",
+        \\    "inputSchema": {
+        \\      "type": "object",
+        \\      "properties": {
+        \\        "name": { "type": "string", "description": "Name to greet" },
+        \\        "style": {
+        \\          "type": "string",
+        \\          "enum": ["formal", "casual", "enthusiastic"],
+        \\          "default": "casual"
+        \\        }
+        \\      },
+        \\      "required": ["name"]
+        \\    }
+        \\  },
+        \\  {
+        \\    "name": "timestamp",
+        \\    "description": "Returns the current server timestamp",
+        \\    "inputSchema": {
+        \\      "type": "object",
+        \\      "properties": {}
+        \\    }
+        \\  }
+        \\]}
+    );
 }
 
 fn callTool(
@@ -163,21 +175,21 @@ fn callTool(
     // Route to appropriate tool handler
     if (std.mem.eql(u8, name, "calculator")) {
         // In a real implementation, parse args_json and compute result
-        return
-        \\{"content":[{"type":"text","text":"Calculator result: 42"}]}
-        ;
+        return owned(
+            \\{"content":[{"type":"text","text":"Calculator result: 42"}]}
+        );
     }
 
     if (std.mem.eql(u8, name, "greeting")) {
-        return
-        \\{"content":[{"type":"text","text":"Hello! Nice to meet you!"}]}
-        ;
+        return owned(
+            \\{"content":[{"type":"text","text":"Hello! Nice to meet you!"}]}
+        );
     }
 
     if (std.mem.eql(u8, name, "timestamp")) {
-        return
-        \\{"content":[{"type":"text","text":"Current timestamp: 2025-01-24T12:00:00Z"}]}
-        ;
+        return owned(
+            \\{"content":[{"type":"text","text":"Current timestamp: 2025-01-24T12:00:00Z"}]}
+        );
     }
 
     return error.ToolNotFound;
@@ -185,7 +197,7 @@ fn callTool(
 
 // Stub implementations for other callbacks
 fn listResources(_: ?*anyopaque, _: ?[]const u8) anyerror![]const u8 {
-    return "{\"resources\":[]}";
+    return owned("{\"resources\":[]}");
 }
 
 fn readResource(_: ?*anyopaque, _: []const u8) anyerror![]const u8 {
@@ -193,14 +205,14 @@ fn readResource(_: ?*anyopaque, _: []const u8) anyerror![]const u8 {
 }
 
 fn listResourceTemplates(_: ?*anyopaque) anyerror![]const u8 {
-    return "{\"resourceTemplates\":[]}";
+    return owned("{\"resourceTemplates\":[]}");
 }
 
 fn subscribeResource(_: ?*anyopaque, _: []const u8) anyerror!void {}
 fn unsubscribeResource(_: ?*anyopaque, _: []const u8) anyerror!void {}
 
 fn listPrompts(_: ?*anyopaque, _: ?[]const u8) anyerror![]const u8 {
-    return "{\"prompts\":[]}";
+    return owned("{\"prompts\":[]}");
 }
 
 fn getPrompt(_: ?*anyopaque, _: []const u8, _: ?[]const u8) anyerror![]const u8 {
@@ -208,7 +220,7 @@ fn getPrompt(_: ?*anyopaque, _: []const u8, _: ?[]const u8) anyerror![]const u8 
 }
 
 fn complete(_: ?*anyopaque, _: []const u8) anyerror![]const u8 {
-    return "{\"completion\":{\"values\":[]}}";
+    return owned("{\"completion\":{\"values\":[]}}");
 }
 
 fn setLogLevel(_: ?*anyopaque, _: []const u8) anyerror!void {}

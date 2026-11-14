@@ -14,7 +14,7 @@ This directory contains practical examples demonstrating how to use the MCP (Mod
 | [06_client_example.zig](06_client_example.zig) | Building MCP client requests |
 | [07_notifications.zig](07_notifications.zig) | Server-to-client notifications |
 
-> **⚠️ `tools/call` ownership (since v0.1.12):** the server frees every `callTool` result with its own allocator. Handlers MUST return allocator-owned bytes (e.g. `allocator.dupe(u8, ...)`) — returning a static string literal will be invalid-freed. Examples 01, 02, 05, and 07 still return static literals for brevity and have NOT been updated; copy the allocator-owned pattern from [03_tool_registration.zig](03_tool_registration.zig) instead.
+> **Handler result ownership:** the server frees every slice a handler callback returns (`listTools`, `callTool`, `listResources`, `readResource`, `listResourceTemplates`, `listPrompts`, `getPrompt`, `complete`) with the allocator passed to `Server.init`. Callbacks MUST return bytes allocated with that allocator (e.g. `allocator.dupe(u8, ...)`); returning a static string literal is an invalid free. The examples return fixed text through a small `owned()` helper that copies it with the server's allocator.
 
 ## Building the Examples
 

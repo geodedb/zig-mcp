@@ -16,6 +16,17 @@
 const std = @import("std");
 const mcp = @import("mcp");
 
+/// The server frees every slice a handler callback returns, using the
+/// allocator the server was built with (see "Result Ownership" on
+/// `mcp.Handler`). Callbacks therefore return copies made with that same
+/// allocator, never string literals. `main` sets this before serving.
+var result_allocator: std.mem.Allocator = undefined;
+
+/// Returns a server-owned copy of `text`.
+fn owned(text: []const u8) ![]const u8 {
+    return result_allocator.dupe(u8, text);
+}
+
 /// Server state that tracks dynamic content
 const DynamicState = struct {
     allocator: std.mem.Allocator,
@@ -100,6 +111,7 @@ pub fn main() !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
+    result_allocator = allocator;
 
     var state = DynamicState.init(allocator);
     defer state.deinit();
@@ -169,57 +181,57 @@ pub fn main() !void {
 
 fn listTools(_: ?*anyopaque, _: ?[]const u8) anyerror![]const u8 {
     // Return current tools (in a real implementation, build dynamically)
-    return
-    \\{"tools":[
-    \\  {
-    \\    "name": "add-tool",
-    \\    "description": "Add a new tool dynamically (triggers notifications/tools/list_changed)",
-    \\    "inputSchema": {
-    \\      "type": "object",
-    \\      "properties": {
-    \\        "name": { "type": "string" },
-    \\        "description": { "type": "string" }
-    \\      },
-    \\      "required": ["name", "description"]
-    \\    }
-    \\  },
-    \\  {
-    \\    "name": "add-resource",
-    \\    "description": "Add a new resource dynamically (triggers notifications/resources/list_changed)",
-    \\    "inputSchema": {
-    \\      "type": "object",
-    \\      "properties": {
-    \\        "uri": { "type": "string" },
-    \\        "name": { "type": "string" }
-    \\      },
-    \\      "required": ["uri", "name"]
-    \\    }
-    \\  },
-    \\  {
-    \\    "name": "update-resource",
-    \\    "description": "Notify about a resource update (triggers notifications/resources/updated)",
-    \\    "inputSchema": {
-    \\      "type": "object",
-    \\      "properties": {
-    \\        "uri": { "type": "string", "description": "URI of the updated resource" }
-    \\      },
-    \\      "required": ["uri"]
-    \\    }
-    \\  },
-    \\  {
-    \\    "name": "log",
-    \\    "description": "Emit a log message to clients (triggers notifications/message)",
-    \\    "inputSchema": {
-    \\      "type": "object",
-    \\      "properties": {
-    \\        "level": { "type": "string", "enum": ["debug", "info", "warning", "error"] },
-    \\        "message": { "type": "string" }
-    \\      },
-    \\      "required": ["level", "message"]
-    \\    }
-    \\  }
-    \\]}
-    ;
+    return owned(
+        \\{"tools":[
+        \\  {
+        \\    "name": "add-tool",
+        \\    "description": "Add a new tool dynamically (triggers notifications/tools/list_changed)",
+        \\    "inputSchema": {
+        \\      "type": "object",
+        \\      "properties": {
+        \\        "name": { "type": "string" },
+        \\        "description": { "type": "string" }
+        \\      },
+        \\      "required": ["name", "description"]
+        \\    }
+        \\  },
+        \\  {
+        \\    "name": "add-resource",
+        \\    "description": "Add a new resource dynamically (triggers notifications/resources/list_changed)",
+        \\    "inputSchema": {
+        \\      "type": "object",
+        \\      "properties": {
+        \\        "uri": { "type": "string" },
+        \\        "name": { "type": "string" }
+        \\      },
+        \\      "required": ["uri", "name"]
+        \\    }
+        \\  },
+        \\  {
+        \\    "name": "update-resource",
+        \\    "description": "Notify about a resource update (triggers notifications/resources/updated)",
+        \\    "inputSchema": {
+        \\      "type": "object",
+        \\      "properties": {
+        \\        "uri": { "type": "string", "description": "URI of the updated resource" }
+        \\      },
+        \\      "required": ["uri"]
+        \\    }
+        \\  },
+        \\  {
+        \\    "name": "log",
+        \\    "description": "Emit a log message to clients (triggers notifications/message)",
+        \\    "inputSchema": {
+        \\      "type": "object",
+        \\      "properties": {
+        \\        "level": { "type": "string", "enum": ["debug", "info", "warning", "error"] },
+        \\        "message": { "type": "string" }
+        \\      },
+        \\      "required": ["level", "message"]
+        \\    }
+        \\  }
+        \\]}
+    );
 }
 
 fn callTool(
@@ -233,54 +245,54 @@ fn callTool(
     if (std.mem.eql(u8, name, "add-tool")) {
         // In a real implementation, parse args and add the tool
         try state.addTool("new-dynamic-tool", "A dynamically added tool");
-        return
-        \\{"content":[{"type":"text","text":"Tool added! Notification sent to clients."}]}
-        ;
+        return owned(
+            \\{"content":[{"type":"text","text":"Tool added! Notification sent to clients."}]}
+        );
     }
 
     if (std.mem.eql(u8, name, "add-resource")) {
         try state.addResource("data://dynamic", "Dynamic Resource");
-        return
-        \\{"content":[{"type":"text","text":"Resource added! Notification sent to clients."}]}
-        ;
+        return owned(
+            \\{"content":[{"type":"text","text":"Resource added! Notification sent to clients."}]}
+        );
     }
 
     if (std.mem.eql(u8, name, "update-resource")) {
         state.updateResource("data://counter");
-        return
-        \\{"content":[{"type":"text","text":"Resource update notification sent!"}]}
-        ;
+        return owned(
+            \\{"content":[{"type":"text","text":"Resource update notification sent!"}]}
+        );
     }
 
     if (std.mem.eql(u8, name, "log")) {
         state.emitLog("info", "This is a log message from the server");
-        return
-        \\{"content":[{"type":"text","text":"Log message emitted to clients!"}]}
-        ;
+        return owned(
+            \\{"content":[{"type":"text","text":"Log message emitted to clients!"}]}
+        );
     }
 
     return error.ToolNotFound;
 }
 
 fn listResources(_: ?*anyopaque, _: ?[]const u8) anyerror![]const u8 {
-    return
-    \\{"resources":[
-    \\  {"uri": "data://counter", "name": "Dynamic Counter", "mimeType": "application/json"}
-    \\]}
-    ;
+    return owned(
+        \\{"resources":[
+        \\  {"uri": "data://counter", "name": "Dynamic Counter", "mimeType": "application/json"}
+        \\]}
+    );
 }
 
 fn readResource(_: ?*anyopaque, uri: []const u8) anyerror![]const u8 {
     if (std.mem.eql(u8, uri, "data://counter")) {
-        return
-        \\{"contents":[{"uri":"data://counter","mimeType":"application/json","text":"{\"count\":42}"}]}
-        ;
+        return owned(
+            \\{"contents":[{"uri":"data://counter","mimeType":"application/json","text":"{\"count\":42}"}]}
+        );
     }
     return error.ResourceNotFound;
 }
 
 fn listResourceTemplates(_: ?*anyopaque) anyerror![]const u8 {
-    return "{\"resourceTemplates\":[]}";
+    return owned("{\"resourceTemplates\":[]}");
 }
 
 fn subscribeResource(_: ?*anyopaque, uri: []const u8) anyerror!void {
@@ -292,7 +304,7 @@ fn unsubscribeResource(_: ?*anyopaque, uri: []const u8) anyerror!void {
 }
 
 fn listPrompts(_: ?*anyopaque, _: ?[]const u8) anyerror![]const u8 {
-    return "{\"prompts\":[]}";
+    return owned("{\"prompts\":[]}");
 }
 
 fn getPrompt(_: ?*anyopaque, _: []const u8, _: ?[]const u8) anyerror![]const u8 {
@@ -300,7 +312,7 @@ fn getPrompt(_: ?*anyopaque, _: []const u8, _: ?[]const u8) anyerror![]const u8 
 }
 
 fn complete(_: ?*anyopaque, _: []const u8) anyerror![]const u8 {
-    return "{\"completion\":{\"values\":[]}}";
+    return owned("{\"completion\":{\"values\":[]}}");
 }
 
 fn setLogLevel(_: ?*anyopaque, level: []const u8) anyerror!void {

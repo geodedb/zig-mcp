@@ -404,9 +404,27 @@ pub fn build(b: *std.Build) void {
     const run_conformance_test = b.addRunArtifact(conformance_test);
     test_step.dependOn(&run_conformance_test.step);
 
+    // Handler result ownership tests (SONNY-6531)
+    const ownership_test_mod = b.createModule(.{
+        .root_source_file = b.path("tests/ownership.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "mcp", .module = mcp_mod },
+        },
+    });
+    const ownership_test = b.addTest(.{
+        .root_module = ownership_test_mod,
+    });
+    const run_ownership_test = b.addRunArtifact(ownership_test);
+    test_step.dependOn(&run_ownership_test.step);
+
     // Separate test steps
     const test_accept_step = b.step("test-accept", "Run acceptance tests only");
     test_accept_step.dependOn(&run_accept_test.step);
+
+    const test_ownership_step = b.step("test-ownership", "Run handler result ownership tests only");
+    test_ownership_step.dependOn(&run_ownership_test.step);
 
     const test_conformance_step = b.step("test-conformance", "Run conformance tests only");
     test_conformance_step.dependOn(&run_conformance_test.step);
