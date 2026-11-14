@@ -13,6 +13,17 @@
 const std = @import("std");
 const mcp = @import("mcp");
 
+/// The server frees every slice a handler callback returns, using the
+/// allocator the server was built with (see "Result Ownership" on
+/// `mcp.Handler`). Callbacks therefore return copies made with that same
+/// allocator, never string literals. `main` sets this before serving.
+var result_allocator: std.mem.Allocator = undefined;
+
+/// Returns a server-owned copy of `text`.
+fn owned(text: []const u8) ![]const u8 {
+    return result_allocator.dupe(u8, text);
+}
+
 // ============================================================================
 // Server State
 // ============================================================================
@@ -49,6 +60,7 @@ pub fn main() !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
+    result_allocator = allocator;
 
     // Create server state that will be passed to handlers via context
     var state = ServerState.init(allocator);
@@ -101,83 +113,83 @@ pub fn main() !void {
 
 fn listTools(_: ?*anyopaque, _: ?[]const u8) anyerror![]const u8 {
     // Comprehensive tool definitions with metadata
-    return
-    \\{"tools":[
-    \\  {
-    \\    "name": "counter",
-    \\    "title": "Persistent Counter",
-    \\    "description": "A counter that persists across calls. Supports increment, decrement, get, and reset operations.",
-    \\    "inputSchema": {
-    \\      "type": "object",
-    \\      "properties": {
-    \\        "operation": {
-    \\          "type": "string",
-    \\          "enum": ["increment", "decrement", "get", "reset"],
-    \\          "description": "The operation to perform on the counter"
-    \\        },
-    \\        "amount": {
-    \\          "type": "integer",
-    \\          "default": 1,
-    \\          "description": "Amount to increment/decrement by (default: 1)"
-    \\        }
-    \\      },
-    \\      "required": ["operation"]
-    \\    },
-    \\    "annotations": {
-    \\      "destructive": false,
-    \\      "idempotent": false,
-    \\      "openWorld": false
-    \\    }
-    \\  },
-    \\  {
-    \\    "name": "storage",
-    \\    "title": "Key-Value Storage",
-    \\    "description": "Store and retrieve key-value pairs. Data persists for the lifetime of the server.",
-    \\    "inputSchema": {
-    \\      "type": "object",
-    \\      "properties": {
-    \\        "operation": {
-    \\          "type": "string",
-    \\          "enum": ["get", "set", "delete", "list"],
-    \\          "description": "The storage operation to perform"
-    \\        },
-    \\        "key": {
-    \\          "type": "string",
-    \\          "description": "The key to operate on (required for get/set/delete)"
-    \\        },
-    \\        "value": {
-    \\          "type": "string",
-    \\          "description": "The value to store (required for set)"
-    \\        }
-    \\      },
-    \\      "required": ["operation"]
-    \\    },
-    \\    "annotations": {
-    \\      "destructive": true,
-    \\      "idempotent": false
-    \\    }
-    \\  },
-    \\  {
-    \\    "name": "longTask",
-    \\    "title": "Long-Running Task",
-    \\    "description": "Simulates a long-running task that can be cancelled. Useful for testing cancellation support.",
-    \\    "inputSchema": {
-    \\      "type": "object",
-    \\      "properties": {
-    \\        "durationMs": {
-    \\          "type": "integer",
-    \\          "default": 5000,
-    \\          "description": "How long the task should run in milliseconds"
-    \\        }
-    \\      }
-    \\    },
-    \\    "annotations": {
-    \\      "destructive": false,
-    \\      "idempotent": true
-    \\    }
-    \\  }
-    \\]}
-    ;
+    return owned(
+        \\{"tools":[
+        \\  {
+        \\    "name": "counter",
+        \\    "title": "Persistent Counter",
+        \\    "description": "A counter that persists across calls. Supports increment, decrement, get, and reset operations.",
+        \\    "inputSchema": {
+        \\      "type": "object",
+        \\      "properties": {
+        \\        "operation": {
+        \\          "type": "string",
+        \\          "enum": ["increment", "decrement", "get", "reset"],
+        \\          "description": "The operation to perform on the counter"
+        \\        },
+        \\        "amount": {
+        \\          "type": "integer",
+        \\          "default": 1,
+        \\          "description": "Amount to increment/decrement by (default: 1)"
+        \\        }
+        \\      },
+        \\      "required": ["operation"]
+        \\    },
+        \\    "annotations": {
+        \\      "destructive": false,
+        \\      "idempotent": false,
+        \\      "openWorld": false
+        \\    }
+        \\  },
+        \\  {
+        \\    "name": "storage",
+        \\    "title": "Key-Value Storage",
+        \\    "description": "Store and retrieve key-value pairs. Data persists for the lifetime of the server.",
+        \\    "inputSchema": {
+        \\      "type": "object",
+        \\      "properties": {
+        \\        "operation": {
+        \\          "type": "string",
+        \\          "enum": ["get", "set", "delete", "list"],
+        \\          "description": "The storage operation to perform"
+        \\        },
+        \\        "key": {
+        \\          "type": "string",
+        \\          "description": "The key to operate on (required for get/set/delete)"
+        \\        },
+        \\        "value": {
+        \\          "type": "string",
+        \\          "description": "The value to store (required for set)"
+        \\        }
+        \\      },
+        \\      "required": ["operation"]
+        \\    },
+        \\    "annotations": {
+        \\      "destructive": true,
+        \\      "idempotent": false
+        \\    }
+        \\  },
+        \\  {
+        \\    "name": "longTask",
+        \\    "title": "Long-Running Task",
+        \\    "description": "Simulates a long-running task that can be cancelled. Useful for testing cancellation support.",
+        \\    "inputSchema": {
+        \\      "type": "object",
+        \\      "properties": {
+        \\        "durationMs": {
+        \\          "type": "integer",
+        \\          "default": 5000,
+        \\          "description": "How long the task should run in milliseconds"
+        \\        }
+        \\      }
+        \\    },
+        \\    "annotations": {
+        \\      "destructive": false,
+        \\      "idempotent": true
+        \\    }
+        \\  }
+        \\]}
+    );
 }
 
 fn callTool(
@@ -211,9 +223,9 @@ fn handleCounter(state: *ServerState, _: []const u8) ![]const u8 {
     const new_value = state.counter.fetchAdd(1, .monotonic) + 1;
     _ = new_value;
 
-    return
-    \\{"content":[{"type":"text","text":"Counter incremented. Current value: 1"}]}
-    ;
+    return owned(
+        \\{"content":[{"type":"text","text":"Counter incremented. Current value: 1"}]}
+    );
 }
 
 /// Handle storage operations
@@ -226,9 +238,9 @@ fn handleStorage(state: *ServerState, _: []const u8) ![]const u8 {
     const count = state.storage.count();
     _ = count;
 
-    return
-    \\{"content":[{"type":"text","text":"Storage contains 0 items"}]}
-    ;
+    return owned(
+        \\{"content":[{"type":"text","text":"Storage contains 0 items"}]}
+    );
 }
 
 /// Handle long-running task with cancellation support
@@ -240,9 +252,9 @@ fn handleLongTask(cancel: *const mcp.CancelToken, _: []const u8) ![]const u8 {
     for (0..iterations) |i| {
         // Check for cancellation periodically
         if (cancel.isCancelled()) {
-            return
-            \\{"content":[{"type":"text","text":"Task was cancelled"}],"isError":true}
-            ;
+            return owned(
+                \\{"content":[{"type":"text","text":"Task was cancelled"}],"isError":true}
+            );
         }
 
         // Simulate work
@@ -250,9 +262,9 @@ fn handleLongTask(cancel: *const mcp.CancelToken, _: []const u8) ![]const u8 {
         _ = i;
     }
 
-    return
-    \\{"content":[{"type":"text","text":"Long task completed successfully!"}]}
-    ;
+    return owned(
+        \\{"content":[{"type":"text","text":"Long task completed successfully!"}]}
+    );
 }
 
 // ============================================================================
@@ -260,7 +272,7 @@ fn handleLongTask(cancel: *const mcp.CancelToken, _: []const u8) ![]const u8 {
 // ============================================================================
 
 fn listResources(_: ?*anyopaque, _: ?[]const u8) anyerror![]const u8 {
-    return "{\"resources\":[]}";
+    return owned("{\"resources\":[]}");
 }
 
 fn readResource(_: ?*anyopaque, _: []const u8) anyerror![]const u8 {
@@ -268,14 +280,14 @@ fn readResource(_: ?*anyopaque, _: []const u8) anyerror![]const u8 {
 }
 
 fn listResourceTemplates(_: ?*anyopaque) anyerror![]const u8 {
-    return "{\"resourceTemplates\":[]}";
+    return owned("{\"resourceTemplates\":[]}");
 }
 
 fn subscribeResource(_: ?*anyopaque, _: []const u8) anyerror!void {}
 fn unsubscribeResource(_: ?*anyopaque, _: []const u8) anyerror!void {}
 
 fn listPrompts(_: ?*anyopaque, _: ?[]const u8) anyerror![]const u8 {
-    return "{\"prompts\":[]}";
+    return owned("{\"prompts\":[]}");
 }
 
 fn getPrompt(_: ?*anyopaque, _: []const u8, _: ?[]const u8) anyerror![]const u8 {
@@ -283,7 +295,7 @@ fn getPrompt(_: ?*anyopaque, _: []const u8, _: ?[]const u8) anyerror![]const u8 
 }
 
 fn complete(_: ?*anyopaque, _: []const u8) anyerror![]const u8 {
-    return "{\"completion\":{\"values\":[]}}";
+    return owned("{\"completion\":{\"values\":[]}}");
 }
 
 fn setLogLevel(_: ?*anyopaque, _: []const u8) anyerror!void {}

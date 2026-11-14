@@ -1282,27 +1282,58 @@ const RequestInfo = struct {
 /// }]}
 /// ```
 ///
+/// ## Result Ownership (SONNY-6531)
+///
+/// Every callback that returns `[]const u8` (`listTools`, `callTool`,
+/// `listResources`, `readResource`, `listResourceTemplates`, `listPrompts`,
+/// `getPrompt`, `complete`) transfers ownership of the returned slice to the
+/// server. The server frees it with the allocator it was constructed with
+/// (`Server.allocator`) once the JSON-RPC response has been built, and also
+/// when the request was a notification (no response is sent) or building the
+/// response failed. Implementations MUST therefore return bytes allocated
+/// with that same allocator on every successful call: a static/comptime
+/// string literal, a slice into a buffer the handler keeps, or bytes from
+/// another allocator would be freed by the server (an invalid free). To
+/// return fixed text, `dupe` it: `return allocator.dupe(u8, "{...}");`.
+/// A callback that returns an error hands nothing over and must free
+/// anything it allocated itself. Argument slices (`cursor`, `name`, `uri`,
+/// `args_json`, `params_json`, `level`) are borrowed from the server and are
+/// only valid for the duration of the call.
+///
 pub const Handler = struct {
     ctx: ?*anyopaque = null,
+    /// `tools/list`. Returns a `Server.allocator`-owned slice the server
+    /// frees (see "Result Ownership" above).
     listTools: *const fn (ctx: ?*anyopaque, cursor: ?[]const u8) anyerror![]const u8,
-    /// Ownership contract: the server always frees the returned slice with
-    /// the allocator it was constructed with (`Server.allocator`) once the
-    /// JSON-RPC response has been built. Implementations MUST therefore
-    /// return bytes allocated with that same allocator on every call --
-    /// static/comptime string literals are NOT safe to return here (unlike
-    /// e.g. `listTools`/`listResources`, which the server treats as
-    /// possibly-static and never frees). Tool responses are typically
-    /// per-call heap allocations (JSON built from user/tool-supplied data),
-    /// so a long-running server that never frees them leaks for its whole
-    /// lifetime -- see the `tools/call` dispatch site in `handleMethod`.
+    /// `tools/call`. Returns a `Server.allocator`-owned slice the server
+    /// frees (see "Result Ownership" above); owned since v0.1.12. Tool
+    /// responses are typically per-call heap allocations (JSON built from
+    /// user/tool-supplied data), so a server that did not free them would
+    /// leak for its whole lifetime.
     callTool: *const fn (ctx: ?*anyopaque, name: []const u8, args_json: []const u8, cancel: *const CancelToken) anyerror![]const u8,
+    /// `resources/list`. Returns a `Server.allocator`-owned slice the server
+    /// frees (see "Result Ownership" above).
     listResources: *const fn (ctx: ?*anyopaque, cursor: ?[]const u8) anyerror![]const u8,
+    /// `resources/read`. Returns a `Server.allocator`-owned slice the server
+    /// frees (see "Result Ownership" above). Resource contents are usually
+    /// read or rendered per call, so this is the callback most likely to
+    /// leak if it were not freed.
     readResource: *const fn (ctx: ?*anyopaque, uri: []const u8) anyerror![]const u8,
+    /// `resources/templates/list`. Returns a `Server.allocator`-owned slice
+    /// the server frees (see "Result Ownership" above).
     listResourceTemplates: *const fn (ctx: ?*anyopaque) anyerror![]const u8,
     subscribeResource: *const fn (ctx: ?*anyopaque, uri: []const u8) anyerror!void,
     unsubscribeResource: *const fn (ctx: ?*anyopaque, uri: []const u8) anyerror!void, // GAP-022
+    /// `prompts/list`. Returns a `Server.allocator`-owned slice the server
+    /// frees (see "Result Ownership" above).
     listPrompts: *const fn (ctx: ?*anyopaque, cursor: ?[]const u8) anyerror![]const u8,
+    /// `prompts/get`. Returns a `Server.allocator`-owned slice the server
+    /// frees (see "Result Ownership" above). `args_json` is the serialized
+    /// `arguments` object (or null) and is freed by the server after the call.
     getPrompt: *const fn (ctx: ?*anyopaque, name: []const u8, args_json: ?[]const u8) anyerror![]const u8,
+    /// `completion/complete`. Returns a `Server.allocator`-owned slice the
+    /// server frees (see "Result Ownership" above). `params_json` is the
+    /// serialized request params and is freed by the server after the call.
     complete: *const fn (ctx: ?*anyopaque, params_json: []const u8) anyerror![]const u8,
     setLogLevel: *const fn (ctx: ?*anyopaque, level: []const u8) anyerror!void,
 };
@@ -2931,27 +2962,21 @@ pub const Server = struct {
             return @as(?[]const u8, try self.makeErrorResponse(id, error_code, @errorName(err)));
         };
 
+        // Free the intermediate result if it was dynamically allocated: after
+        // the response is built, for a notification (no response), and when
+        // building the response fails.
+        defer if (method_result.result) |r| {
+            if (method_result.owned) self.allocator.free(r);
+        };
+
         // If no id, this is a notification - no response
         if (id == null) {
-            // Free dynamically allocated result if present
-            if (method_result.result) |r| {
-                if (method_result.owned) {
-                    self.allocator.free(r);
-                }
-            }
             observability.endRpcServerSpan(__obs_span, true, 0);
             return null;
         }
 
         // Build success response
         const response = try self.makeSuccessResponse(id.?, method_result.result);
-
-        // Free the intermediate result if it was dynamically allocated
-        if (method_result.result) |r| {
-            if (method_result.owned) {
-                self.allocator.free(r);
-            }
-        }
 
         observability.endRpcServerSpan(__obs_span, true, 0);
         return @as(?[]const u8, response);
@@ -2985,8 +3010,8 @@ pub const Server = struct {
 
         if (std.mem.eql(u8, method, "tools/list")) {
             const cursor = self.extractCursor(params);
-            // Handler results are not owned - handlers may return static strings
-            return .{ .result = try self.handler.listTools(self.handler.ctx, cursor), .owned = false };
+            // Handler results are server-owned (see Handler "Result Ownership").
+            return .{ .result = try self.handler.listTools(self.handler.ctx, cursor), .owned = true };
         } else if (std.mem.eql(u8, method, "tools/call")) {
             const name = self.extractString(params, "name") orelse return error.InvalidParams;
 
@@ -3006,21 +3031,18 @@ pub const Server = struct {
 
             var cancel = CancelToken{};
 
-            // callTool results are always allocator-owned per the Handler.callTool
-            // ownership contract (see doc comment on the field) -- the server frees
-            // this slice below in dispatch(). Fixes a server-lifetime leak: every
-            // dynamically-allocated tool response previously went unfreed because
-            // this dispatch site was hardcoded owned=false.
+            // Handler results are server-owned (see Handler "Result Ownership");
+            // processJsonValue frees this slice once the response is built.
             return .{ .result = try self.handler.callTool(self.handler.ctx, name, args_json, &cancel), .owned = true };
         } else if (std.mem.eql(u8, method, "resources/list")) {
             const cursor = self.extractCursor(params);
-            return .{ .result = try self.handler.listResources(self.handler.ctx, cursor), .owned = false };
+            return .{ .result = try self.handler.listResources(self.handler.ctx, cursor), .owned = true };
         } else if (std.mem.eql(u8, method, "resources/read")) {
             const uri = self.extractString(params, "uri") orelse return error.InvalidParams;
             if (!validateUri(uri)) return error.InvalidParams; // GAP-030
-            return .{ .result = try self.handler.readResource(self.handler.ctx, uri), .owned = false };
+            return .{ .result = try self.handler.readResource(self.handler.ctx, uri), .owned = true };
         } else if (std.mem.eql(u8, method, "resources/templates/list")) {
-            return .{ .result = try self.handler.listResourceTemplates(self.handler.ctx), .owned = false };
+            return .{ .result = try self.handler.listResourceTemplates(self.handler.ctx), .owned = true };
         } else if (std.mem.eql(u8, method, "resources/subscribe")) {
             const uri = self.extractString(params, "uri") orelse return error.InvalidParams;
             if (!validateUri(uri)) return error.InvalidParams; // GAP-030
@@ -3034,17 +3056,19 @@ pub const Server = struct {
             return .{ .result = "{}", .owned = false };
         } else if (std.mem.eql(u8, method, "prompts/list")) {
             const cursor = self.extractCursor(params);
-            return .{ .result = try self.handler.listPrompts(self.handler.ctx, cursor), .owned = false };
+            return .{ .result = try self.handler.listPrompts(self.handler.ctx, cursor), .owned = true };
         } else if (std.mem.eql(u8, method, "prompts/get")) {
             const name = self.extractString(params, "name") orelse return error.InvalidParams;
             var args_json: ?[]const u8 = null;
             if (self.extractObject(params, "arguments")) |a| {
                 args_json = try json.stringify(self.allocator, a);
             }
-            return .{ .result = try self.handler.getPrompt(self.handler.ctx, name, args_json), .owned = false };
+            defer if (args_json) |a| self.allocator.free(a);
+            return .{ .result = try self.handler.getPrompt(self.handler.ctx, name, args_json), .owned = true };
         } else if (std.mem.eql(u8, method, "completion/complete")) {
-            const params_json = if (params) |p| try json.stringify(self.allocator, p) else "{}";
-            return .{ .result = try self.handler.complete(self.handler.ctx, params_json), .owned = false };
+            const params_json: ?[]const u8 = if (params) |p| try json.stringify(self.allocator, p) else null;
+            defer if (params_json) |p| self.allocator.free(p);
+            return .{ .result = try self.handler.complete(self.handler.ctx, params_json orelse "{}"), .owned = true };
         } else if (std.mem.eql(u8, method, "logging/setLevel")) {
             const level = self.extractString(params, "level") orelse return error.InvalidParams;
             try self.handler.setLogLevel(self.handler.ctx, level);
@@ -3602,13 +3626,14 @@ pub const Server = struct {
 // ============================================================================
 
 pub const DemoHandler = struct {
-    /// Allocator `callTool` uses to produce server-owned results, per the
-    /// `Handler.callTool` ownership contract (the dispatcher always frees
-    /// the returned slice with `Server.allocator`). Threaded per-instance
-    /// via `Handler.ctx` (see `handler()`) rather than a package-level
-    /// global, so multiple `DemoHandler` instances (e.g. concurrent tests
-    /// or servers in the same process) each carry their own allocator
-    /// instead of racing on shared mutable state.
+    /// Allocator the callbacks use to produce server-owned results, per the
+    /// `Handler` "Result Ownership" contract (the dispatcher frees every
+    /// returned slice with `Server.allocator`, so this must be the same
+    /// allocator the server is built with). Threaded per-instance via
+    /// `Handler.ctx` (see `handler()`) rather than a package-level global,
+    /// so multiple `DemoHandler` instances (e.g. concurrent tests or servers
+    /// in the same process) each carry their own allocator instead of racing
+    /// on shared mutable state.
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) DemoHandler {
@@ -3635,53 +3660,54 @@ pub const DemoHandler = struct {
         };
     }
 
-    fn listTools(_: ?*anyopaque, _: ?[]const u8) anyerror![]const u8 {
-        const result: []const u8 =
+    /// Returns a server-owned copy of `text` (results are freed by the
+    /// server, so static literals must not be returned directly).
+    fn owned(ctx: ?*anyopaque, text: []const u8) ![]const u8 {
+        const self: *DemoHandler = @ptrCast(@alignCast(ctx.?));
+        return self.allocator.dupe(u8, text);
+    }
+
+    fn listTools(ctx: ?*anyopaque, _: ?[]const u8) anyerror![]const u8 {
+        return owned(ctx,
             \\{"tools":[{"name":"barrier","description":"Barrier for testing parallelism","inputSchema":{"type":"object","properties":{"count":{"type":"integer"}}}}]}
-        ;
-        return result;
+        );
     }
 
     fn callTool(ctx: ?*anyopaque, name: []const u8, _: []const u8, _: *const CancelToken) anyerror![]const u8 {
         if (std.mem.eql(u8, name, "barrier")) {
-            const result: []const u8 =
+            return owned(ctx,
                 \\{"content":[{"type":"text","text":"barrier passed"}]}
-            ;
-            // tools/call results are owned=true at the dispatch site (the
-            // server frees this with `self.allocator`) -- must return
-            // allocator-owned bytes, not the static literal above.
-            const self: *DemoHandler = @ptrCast(@alignCast(ctx.?));
-            return self.allocator.dupe(u8, result);
+            );
         }
         return error.ToolNotFound;
     }
 
-    fn listResources(_: ?*anyopaque, _: ?[]const u8) anyerror![]const u8 {
-        return "{\"resources\":[]}";
+    fn listResources(ctx: ?*anyopaque, _: ?[]const u8) anyerror![]const u8 {
+        return owned(ctx, "{\"resources\":[]}");
     }
 
     fn readResource(_: ?*anyopaque, _: []const u8) anyerror![]const u8 {
         return error.ResourceNotFound;
     }
 
-    fn listResourceTemplates(_: ?*anyopaque) anyerror![]const u8 {
-        return "{\"resourceTemplates\":[]}";
+    fn listResourceTemplates(ctx: ?*anyopaque) anyerror![]const u8 {
+        return owned(ctx, "{\"resourceTemplates\":[]}");
     }
 
     fn subscribeResource(_: ?*anyopaque, _: []const u8) anyerror!void {}
 
     fn unsubscribeResource(_: ?*anyopaque, _: []const u8) anyerror!void {}
 
-    fn listPrompts(_: ?*anyopaque, _: ?[]const u8) anyerror![]const u8 {
-        return "{\"prompts\":[]}";
+    fn listPrompts(ctx: ?*anyopaque, _: ?[]const u8) anyerror![]const u8 {
+        return owned(ctx, "{\"prompts\":[]}");
     }
 
     fn getPrompt(_: ?*anyopaque, _: []const u8, _: ?[]const u8) anyerror![]const u8 {
         return error.PromptNotFound;
     }
 
-    fn complete(_: ?*anyopaque, _: []const u8) anyerror![]const u8 {
-        return "{\"completion\":{\"values\":[]}}";
+    fn complete(ctx: ?*anyopaque, _: []const u8) anyerror![]const u8 {
+        return owned(ctx, "{\"completion\":{\"values\":[]}}");
     }
 
     fn setLogLevel(_: ?*anyopaque, _: []const u8) anyerror!void {}

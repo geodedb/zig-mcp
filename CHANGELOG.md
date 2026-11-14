@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The server now frees the result of every handler callback, not only `tools/call` (SONNY-6531). `resources/read`, `resources/list`, `resources/templates/list`, `tools/list`, `prompts/list`, `prompts/get` and `completion/complete` results were dispatched as not owned, so every heap-allocated response leaked for the life of a long-running server. Results are freed with `Server.allocator` after the response is built, for notifications, and when building the response fails (that last path also leaked `tools/call` results).
+- `prompts/get` with `arguments` and every `completion/complete` request leaked the JSON the server serialized to pass to the handler; it is now freed after the call.
+- The examples (01, 02, 03, 05, 07) returned string literals from `callTool`, which the server has freed since v0.1.12 (an invalid free on the first `tools/call`); every example callback now returns a copy made with the server's allocator.
+
+### Changed
+
+- **BREAKING for handler authors:** every `Handler` callback that returns `[]const u8` (`listTools`, `callTool`, `listResources`, `readResource`, `listResourceTemplates`, `listPrompts`, `getPrompt`, `complete`) transfers ownership of the slice to the server, which frees it with the allocator passed to `Server.init`. Returning a string literal, a slice the handler keeps, or bytes from another allocator is now an invalid free. Migrate by returning `allocator.dupe(u8, text)` for fixed text. A callback that returns an error hands nothing over. The contract is documented on `Handler` ("Result Ownership"), in README.md and docs/api.md. `DemoHandler` and `cmd/mcp-server` follow it.
+
 ## [0.1.15] - 2026-09-15
 
 ### Changed
