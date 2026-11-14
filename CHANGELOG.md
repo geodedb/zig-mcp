@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.22] - 2026-11-14
+
 ### Fixed
 
 - The server now frees the result of every handler callback, not only `tools/call` (SONNY-6531). `resources/read`, `resources/list`, `resources/templates/list`, `tools/list`, `prompts/list`, `prompts/get` and `completion/complete` results were dispatched as not owned, so every heap-allocated response leaked for the life of a long-running server. Results are freed with `Server.allocator` after the response is built, for notifications, and when building the response fails (that last path also leaked `tools/call` results).
