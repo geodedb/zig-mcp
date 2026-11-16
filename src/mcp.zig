@@ -140,6 +140,15 @@ pub const ServerOptions = struct {
     connection_pool_size: u16 = 10, // HTTP connection pool size
     connection_pool_timeout_ms: u32 = 30000, // Pool connection timeout
     sse_retry_ms: u32 = 3000, // SSE retry hint for clients (GAP-060)
+    /// Streamable HTTP: a session with no request in flight and no open
+    /// stream is dropped after this long idle (0 = never); its id then gets
+    /// 404 (SONNY-6644).
+    http_session_idle_timeout_ms: u32 = 30 * 60 * 1000,
+    /// Streamable HTTP: connections served concurrently; more get 503.
+    http_max_connections: u32 = 64,
+    /// Streamable HTTP: a client must send its whole request within this
+    /// long, else it gets 408 and is dropped (0 = no limit).
+    http_request_timeout_ms: u32 = 30_000,
 
     // Performance options
     use_arena_allocator: bool = false, // Use arena for request processing
@@ -1013,6 +1022,9 @@ pub const Session = struct {
     allocator: Allocator,
     server: *Server,
     session_id: ?[]const u8 = null,
+    /// The Streamable HTTP client this session talks to, or null for stdio
+    /// (SONNY-6644). Its messages go only to that client.
+    http: ?*HttpSession = null,
     pending_requests: std.AutoHashMap(i64, *RequestContext),
     next_request_id: std.atomic.Value(i64) = std.atomic.Value(i64).init(1),
     mutex: std.Io.Mutex = std.Io.Mutex.init,
@@ -1045,7 +1057,7 @@ pub const Session = struct {
     pub fn notify(self: *Session, method: []const u8, params_json: ?[]const u8) anyerror!void {
         const notification = try self.buildNotification(method, params_json);
         defer self.allocator.free(notification);
-        try self.server.sendToClient(notification);
+        try self.server.deliver(self.http, notification);
     }
 
     /// Sends a request to the client and waits up to `timeout_ms` for its
@@ -1085,7 +1097,7 @@ pub const Session = struct {
             _ = self.pending_requests.remove(id);
         };
 
-        try self.server.sendToClient(req);
+        try self.server.deliver(self.http, req);
 
         // Wait for the client's response (resolved by Server.resolveClientResponse).
         const timeout_ns: u64 = @as(u64, timeout_ms) * std.time.ns_per_ms;
@@ -1108,6 +1120,19 @@ pub const Session = struct {
         if (ctx.err) |e| return e;
         if (timed_out) return error.Timeout;
         return error.NoResponse;
+    }
+
+    /// Fails every request still waiting for the client with `err` (the
+    /// session ended or the server stopped).
+    fn failPending(self: *Session, err: anyerror) void {
+        self.mutex.lockUncancelable(io());
+        defer self.mutex.unlock(io());
+        var it = self.pending_requests.valueIterator();
+        while (it.next()) |ctx| {
+            ctx.*.err = err;
+            ctx.*.done.set(io());
+        }
+        self.pending_requests.clearRetainingCapacity();
     }
 
     fn buildNotification(self: *Session, method: []const u8, params_json: ?[]const u8) ![]u8 {
@@ -1641,6 +1666,216 @@ const SseEventBuffer = struct {
 };
 
 // ============================================================================
+// Per-client state (SONNY-6644)
+// ============================================================================
+
+/// In-flight requests by id, for cancellation and duplicate detection
+/// (GAP-024, SONNY-6643). There is one per client: the server's own (stdio
+/// and direct `processMessage`) and one per Streamable HTTP session, so ids
+/// and cancellations never cross clients.
+const RequestRegistry = struct {
+    int_ids: std.AutoHashMapUnmanaged(i64, RequestInfo) = .{},
+    /// Keys borrow the id from the parsed message, which outlives the
+    /// registration.
+    str_ids: std.StringHashMapUnmanaged(RequestInfo) = .{},
+    mutex: std.Io.Mutex = std.Io.Mutex.init,
+
+    fn deinit(self: *RequestRegistry, allocator: Allocator) void {
+        self.int_ids.deinit(allocator);
+        self.str_ids.deinit(allocator);
+    }
+
+    /// Returns `error.DuplicateRequestId`, leaving the existing entry alone,
+    /// when a request with the same id is still in flight.
+    fn register(self: *RequestRegistry, allocator: Allocator, request_id: RequestId, token: *CancelToken) error{ DuplicateRequestId, OutOfMemory }!void {
+        self.mutex.lockUncancelable(io());
+        defer self.mutex.unlock(io());
+        const info: RequestInfo = .{
+            .token = token,
+            .start_time = std.Io.Timestamp.now(io(), .real).toMilliseconds(),
+        };
+        switch (request_id) {
+            .int => |i| {
+                const gop = try self.int_ids.getOrPut(allocator, i);
+                if (gop.found_existing) return error.DuplicateRequestId;
+                gop.value_ptr.* = info;
+            },
+            .str => |str| {
+                const gop = try self.str_ids.getOrPut(allocator, str);
+                if (gop.found_existing) return error.DuplicateRequestId;
+                gop.value_ptr.* = info;
+            },
+        }
+    }
+
+    fn unregister(self: *RequestRegistry, request_id: RequestId) void {
+        self.mutex.lockUncancelable(io());
+        defer self.mutex.unlock(io());
+        switch (request_id) {
+            .int => |i| _ = self.int_ids.remove(i),
+            .str => |str| _ = self.str_ids.remove(str),
+        }
+    }
+
+    /// String and integer ids are distinct: "7" does not match 7.
+    fn cancel(self: *RequestRegistry, request_id: RequestId) void {
+        self.mutex.lockUncancelable(io());
+        defer self.mutex.unlock(io());
+        const info = switch (request_id) {
+            .int => |i| self.int_ids.get(i),
+            .str => |str| self.str_ids.get(str),
+        };
+        if (info) |i| i.token.cancelByPeer();
+    }
+
+    fn expire(self: *RequestRegistry, now: i64, timeout_ms: i64) void {
+        self.mutex.lockUncancelable(io());
+        defer self.mutex.unlock(io());
+        var iter = self.int_ids.iterator();
+        while (iter.next()) |entry| {
+            if (now - entry.value_ptr.start_time > timeout_ms) entry.value_ptr.token.cancel();
+        }
+        var str_iter = self.str_ids.iterator();
+        while (str_iter.next()) |entry| {
+            if (now - entry.value_ptr.start_time > timeout_ms) entry.value_ptr.token.cancel();
+        }
+    }
+};
+
+/// What a client negotiated in `initialize`.
+const ClientState = struct {
+    initialized: bool = false,
+    capabilities: ClientCapabilities = .{},
+    protocol_version: ?[]const u8 = null,
+
+    fn deinit(self: *ClientState, allocator: Allocator) void {
+        if (self.protocol_version) |v| allocator.free(v);
+        if (self.capabilities.experimental) |e| allocator.free(e);
+    }
+};
+
+/// Pointers to the state of the client being served: an HTTP session's, or
+/// the server's own fields for stdio and direct `processMessage`.
+const ClientStateRef = struct {
+    initialized: *bool,
+    capabilities: *ClientCapabilities,
+    protocol_version: *?[]const u8,
+};
+
+/// One Streamable HTTP client (MCP 2025-11-25 basic/transports), created at
+/// `initialize` and identified by its `MCP-Session-Id`. Everything the
+/// server says to this client goes only to this client's streams.
+const HttpSession = struct {
+    server: *Server,
+    /// Owned; also the key in `Server.http_sessions`.
+    id: []u8,
+    /// References from connection threads and `SessionRef`s. Guarded by
+    /// `Server.sessions_mutex`, like `closed` and `last_active_ms`.
+    refs: u32 = 0,
+    closed: bool = false,
+    last_active_ms: i64,
+    client: ClientState = .{},
+    /// Server-to-client requests waiting for this client's responses.
+    session: Session,
+    requests: RequestRegistry = .{},
+    /// The standalone GET stream, written under `stream_mutex`.
+    stream_mutex: std.Io.Mutex = std.Io.Mutex.init,
+    get_stream: ?std.Io.net.Stream = null,
+    /// Messages sent to the GET stream, for `Last-Event-ID` replay. Only
+    /// this session's own events are ever replayed to it.
+    events: SseEventBuffer = .{},
+    /// SSE event ids, unique across all streams of this session.
+    next_event_id: std.atomic.Value(u64) = std.atomic.Value(u64).init(1),
+
+    fn sendOnGetStream(self: *HttpSession, data: []const u8) !void {
+        self.stream_mutex.lockUncancelable(io());
+        defer self.stream_mutex.unlock(io());
+        const id = self.next_event_id.fetchAdd(1, .monotonic);
+        self.events.store(self.server.allocator, id, data);
+        const stream = self.get_stream orelse return error.NoClientStream;
+        try writeSseEvent(stream, id, data);
+    }
+};
+
+/// The SSE response stream of a POSTed request: messages related to that
+/// request are sent here, before its response (Streamable HTTP).
+const PostStream = struct {
+    stream: std.Io.net.Stream,
+    session: *HttpSession,
+    accepts_sse: bool,
+    started: bool = false,
+    mutex: std.Io.Mutex = std.Io.Mutex.init,
+
+    fn sendEvent(self: *PostStream, data: []const u8) !void {
+        self.mutex.lockUncancelable(io());
+        defer self.mutex.unlock(io());
+        if (!self.started) {
+            try writeSseHead(self.stream, self.session.id);
+            self.started = true;
+        }
+        const id = self.session.next_event_id.fetchAdd(1, .monotonic);
+        try writeSseEvent(self.stream, id, data);
+    }
+};
+
+/// Which client the current thread is serving.
+const DispatchContext = struct {
+    http: ?*HttpSession = null,
+    post: ?*PostStream = null,
+};
+
+threadlocal var dispatch_ctx: DispatchContext = .{};
+
+/// A counted reference to the Streamable HTTP client a handler is serving,
+/// from `Server.retainCurrentSession`. Pass it to `Server.enterSession` to
+/// send to that client later, from any thread. Release it when done, and
+/// before `Server.deinit`.
+pub const SessionRef = struct {
+    session: *HttpSession,
+
+    /// The client's `MCP-Session-Id`.
+    pub fn id(self: SessionRef) []const u8 {
+        return self.session.id;
+    }
+
+    pub fn release(self: SessionRef) void {
+        self.session.server.releaseHttpSession(self.session);
+    }
+};
+
+/// Returned by `Server.enterSession`; `exit` restores the previous context.
+pub const SessionScope = struct {
+    previous: DispatchContext,
+
+    pub fn exit(self: SessionScope) void {
+        dispatch_ctx = self.previous;
+    }
+};
+
+fn writeSseHead(stream: std.Io.net.Stream, session_id: []const u8) !void {
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try w.writeAll("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n");
+    try w.print("Mcp-Session-Id: {s}\r\nMCP-Protocol-Version: {s}\r\n\r\n", .{ session_id, ProtocolVersion });
+    try streamWriteAll(stream, w.buffered());
+}
+
+fn writeSseEvent(stream: std.Io.net.Stream, id: u64, data: []const u8) !void {
+    var head: [48]u8 = undefined;
+    const prefix = try std.fmt.bufPrint(&head, "id: {d}\ndata: ", .{id});
+    var w_buf: [4096]u8 = undefined;
+    var sw = stream.writer(io(), &w_buf);
+    sw.interface.writeAll(prefix) catch return error.BrokenPipe;
+    sw.interface.writeAll(data) catch return error.BrokenPipe;
+    sw.interface.writeAll("\n\n") catch return error.BrokenPipe;
+    sw.interface.flush() catch return error.BrokenPipe;
+}
+
+fn nowMs() i64 {
+    return std.Io.Timestamp.now(io(), .awake).toMilliseconds();
+}
+
+// ============================================================================
 // Server Implementation
 // ============================================================================
 
@@ -1659,29 +1894,29 @@ pub const Server = struct {
     // Transport state
     http_listener: ?std.Io.net.Server = null,
     http_thread: ?std.Thread = null,
-    sse_connections: std.ArrayListUnmanaged(*SseConnection) = .empty,
-    sse_mutex: std.Io.Mutex = std.Io.Mutex.init,
 
-    // Session tracking (GAP-011/012)
-    active_sessions: std.StringHashMapUnmanaged(void) = .{},
+    // Streamable HTTP sessions (GAP-011/012, SONNY-6644), keyed by session
+    // id (owned by the session). Guards each session's refs/closed too.
+    http_sessions: std.StringHashMapUnmanaged(*HttpSession) = .{},
     sessions_mutex: std.Io.Mutex = std.Io.Mutex.init,
 
-    // SSE event ID counter (GAP-009)
-    sse_event_id: std.atomic.Value(u64) = std.atomic.Value(u64).init(1),
+    // Open HTTP connections: each runs on its own thread; stop() shuts the
+    // streams down to wake those threads and waits for them.
+    http_conns: std.ArrayListUnmanaged(std.Io.net.Stream) = .empty,
+    http_conns_mutex: std.Io.Mutex = std.Io.Mutex.init,
+    http_connections: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
-    // SSE event ring buffer for Last-Event-ID resumption (GAP-059)
-    sse_event_buffer: SseEventBuffer = .{},
+    // Cancellation and timeout tracking (GAP-024, GAP-005) for stdio and
+    // direct processMessage; each HTTP session has its own.
+    requests: RequestRegistry = .{},
 
-    // Cancellation and timeout tracking (GAP-024, GAP-005)
-    active_requests: std.AutoHashMapUnmanaged(i64, RequestInfo) = .{},
-    /// In-flight requests with a string id. Keys borrow the id from the
-    /// parsed message, which outlives the registration.
-    active_string_requests: std.StringHashMapUnmanaged(RequestInfo) = .{},
-    requests_mutex: std.Io.Mutex = std.Io.Mutex.init,
+    // Serializes building the cached initialize response.
+    init_mutex: std.Io.Mutex = std.Io.Mutex.init,
 
     // Rate limiting (GAP-029)
     rate_limit_tokens: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     rate_limit_last_refill: i64 = 0,
+    rate_mutex: std.Io.Mutex = std.Io.Mutex.init,
 
     // Tasks (GAP-035-040)
     tasks: std.StringHashMapUnmanaged(Task) = .{},
@@ -1727,18 +1962,6 @@ pub const Server = struct {
         created,
         running,
         stopped,
-    };
-
-    const SseConnection = struct {
-        stream: std.Io.net.Stream,
-        session_id: []const u8,
-        allocator: Allocator,
-
-        fn deinit(self: *SseConnection) void {
-            streamClose(self.stream);
-            self.allocator.free(self.session_id);
-            self.allocator.destroy(self);
-        }
     };
 
     pub fn init(a: Allocator, opt: ServerOptions, h: Handler) anyerror!Server {
@@ -1793,32 +2016,16 @@ pub const Server = struct {
             self.pool = null;
         }
 
-        // Clean up SSE connections
-        for (self.sse_connections.items) |conn| {
-            conn.deinit();
-        }
-        self.sse_connections.deinit(self.allocator);
-
-        // Clean up SSE event buffer (GAP-059)
-        self.sse_event_buffer.deinit();
-
-        // Clean up active sessions (GAP-011/012)
+        // HTTP sessions (stop() has drained every connection thread).
         {
-            var keys_to_free = std.ArrayListUnmanaged([]const u8).empty;
-            defer keys_to_free.deinit(self.allocator);
-            var session_iter = self.active_sessions.keyIterator();
-            while (session_iter.next()) |key| {
-                keys_to_free.append(self.allocator, key.*) catch {};
-            }
-            self.active_sessions.deinit(self.allocator);
-            for (keys_to_free.items) |key| {
-                self.allocator.free(key);
-            }
+            var it = self.http_sessions.valueIterator();
+            while (it.next()) |hs| self.destroyHttpSession(hs.*);
+            self.http_sessions.deinit(self.allocator);
+            self.http_conns.deinit(self.allocator);
         }
 
         // Clean up active requests (GAP-024)
-        self.active_requests.deinit(self.allocator);
-        self.active_string_requests.deinit(self.allocator);
+        self.requests.deinit(self.allocator);
 
         if (self.session) |*s| {
             s.deinit();
@@ -1929,12 +2136,12 @@ pub const Server = struct {
 
     /// Notify clients that the tool list has changed (GAP-019)
     pub fn notifyToolListChanged(self: *Server) !void {
-        try self.sendNotification("notifications/tools/list_changed", null);
+        try self.sendNotificationToAll("notifications/tools/list_changed");
     }
 
     /// Notify clients that the resource list has changed (GAP-016)
     pub fn notifyResourceListChanged(self: *Server) !void {
-        try self.sendNotification("notifications/resources/list_changed", null);
+        try self.sendNotificationToAll("notifications/resources/list_changed");
     }
 
     /// Notify clients that a subscribed resource was updated (GAP-017)
@@ -1951,7 +2158,7 @@ pub const Server = struct {
 
     /// Notify clients that the prompt list has changed (GAP-018)
     pub fn notifyPromptListChanged(self: *Server) !void {
-        try self.sendNotification("notifications/prompts/list_changed", null);
+        try self.sendNotificationToAll("notifications/prompts/list_changed");
     }
 
     /// Emit a log message to connected clients (GAP-020)
@@ -1984,17 +2191,18 @@ pub const Server = struct {
     /// Supports all 2025-11-25 spec parameters: systemPrompt, temperature, stopSequences,
     /// tools, toolChoice, modelPreferences, includeContext, metadata
     pub fn requestSamplingFull(self: *Server, req: SamplingRequest) ![]const u8 {
-        if (!self.client_capabilities.sampling) {
+        const caps = self.clientState().capabilities;
+        if (!caps.sampling) {
             return error.SamplingNotSupported;
         }
 
         // Validate tools parameter requires client capability
-        if (req.tools_json != null and !self.client_capabilities.sampling_tools) {
+        if (req.tools_json != null and !caps.sampling_tools) {
             return error.SamplingToolsNotSupported;
         }
 
         // Validate includeContext requires client capability
-        if (req.include_context != null and !self.client_capabilities.sampling_context) {
+        if (req.include_context != null and !caps.sampling_context) {
             return error.SamplingContextNotSupported;
         }
 
@@ -2060,7 +2268,7 @@ pub const Server = struct {
         const params = try buf.toOwnedSlice(self.allocator);
         defer self.allocator.free(params);
 
-        if (self.session) |*s| {
+        if (self.currentSession()) |s| {
             return try s.request("sampling/createMessage", params, 60000);
         }
         return error.NoSession;
@@ -2074,11 +2282,11 @@ pub const Server = struct {
     /// Request filesystem roots from client (GAP-015)
     /// Only works if client declared roots capability
     pub fn requestRoots(self: *Server) ![]const u8 {
-        if (!self.client_capabilities.roots) {
+        if (!self.clientState().capabilities.roots) {
             return error.RootsNotSupported;
         }
 
-        if (self.session) |*s| {
+        if (self.currentSession()) |s| {
             return try s.request("roots/list", null, 30000);
         }
         return error.NoSession;
@@ -2101,7 +2309,7 @@ pub const Server = struct {
         message: []const u8,
         schema_or_url: []const u8,
     ) ![]const u8 {
-        if (!self.client_capabilities.elicitation) {
+        if (!self.clientState().capabilities.elicitation) {
             return error.ElicitationNotSupported;
         }
 
@@ -2129,7 +2337,7 @@ pub const Server = struct {
         const params = try buf.toOwnedSlice(self.allocator);
         defer self.allocator.free(params);
 
-        if (self.session) |*s| {
+        if (self.currentSession()) |s| {
             return try s.request("elicitation/create", params, 300000); // 5 min timeout for user input
         }
         return error.NoSession;
@@ -2184,6 +2392,15 @@ pub const Server = struct {
             self.http_listener = null;
         }
 
+        // SONNY-6644: wake every connection thread (blocked reading a request,
+        // holding a GET stream open, or waiting for a client's response) and
+        // wait until all of them are gone.
+        while (self.http_connections.load(.acquire) > 0) {
+            self.shutdownHttpConnections();
+            self.failAllSessionRequests(error.ServerStopped);
+            io().sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+        }
+
         // The shared thread-pool is shut down in deinit — stop() only tears
         // down listeners/accept loops.
     }
@@ -2199,18 +2416,131 @@ pub const Server = struct {
                 if (err == error.ConnectionAborted) continue;
                 break;
             };
-            self.handleHttpConnection(conn) catch {};
+            if (self.state != .running) {
+                streamClose(conn);
+                break;
+            }
+            self.expireIdleSessions();
+
+            // SONNY-6644: serve each connection on its own thread, so a
+            // request waiting for its client (or an open SSE stream) never
+            // blocks other clients.
+            const active = self.http_connections.fetchAdd(1, .acq_rel);
+            if (active >= self.options.http_max_connections) {
+                _ = self.http_connections.fetchSub(1, .acq_rel);
+                self.sendHttpResponse(conn, 503, "Service Unavailable", null) catch {};
+                streamClose(conn);
+                continue;
+            }
+            const t = std.Thread.spawn(.{}, httpConnectionThread, .{ self, conn }) catch {
+                _ = self.http_connections.fetchSub(1, .acq_rel);
+                self.sendHttpResponse(conn, 503, "Service Unavailable", null) catch {};
+                streamClose(conn);
+                continue;
+            };
+            t.detach();
         }
     }
 
+    fn httpConnectionThread(self: *Server, stream: std.Io.net.Stream) void {
+        defer _ = self.http_connections.fetchSub(1, .acq_rel);
+        self.trackHttpConnection(stream);
+        self.handleHttpConnection(stream) catch {};
+        // Untrack before closing: stop() must never shut down a closed (and
+        // possibly reused) descriptor.
+        self.untrackHttpConnection(stream);
+        streamClose(stream);
+    }
+
+    fn trackHttpConnection(self: *Server, stream: std.Io.net.Stream) void {
+        self.http_conns_mutex.lockUncancelable(io());
+        defer self.http_conns_mutex.unlock(io());
+        self.http_conns.append(self.allocator, stream) catch {};
+    }
+
+    fn untrackHttpConnection(self: *Server, stream: std.Io.net.Stream) void {
+        self.http_conns_mutex.lockUncancelable(io());
+        defer self.http_conns_mutex.unlock(io());
+        for (self.http_conns.items, 0..) |s, i| {
+            if (s.socket.handle == stream.socket.handle) {
+                _ = self.http_conns.swapRemove(i);
+                return;
+            }
+        }
+    }
+
+    fn shutdownHttpConnections(self: *Server) void {
+        self.http_conns_mutex.lockUncancelable(io());
+        defer self.http_conns_mutex.unlock(io());
+        for (self.http_conns.items) |s| s.shutdown(io(), .both) catch {};
+    }
+
+    fn failAllSessionRequests(self: *Server, err: anyerror) void {
+        self.sessions_mutex.lockUncancelable(io());
+        defer self.sessions_mutex.unlock(io());
+        var it = self.http_sessions.valueIterator();
+        while (it.next()) |hs| hs.*.session.failPending(err);
+    }
+
+    const max_http_header_bytes: usize = 16 * 1024;
+
+    /// Reads into `tmp` once the request deadline allows; 0 at end of stream.
+    fn readRequestChunk(self: *Server, stream: std.Io.net.Stream, tmp: []u8, deadline_ms: ?i64) !usize {
+        if (deadline_ms) |dl| {
+            const left = dl - nowMs();
+            if (left <= 0) return error.RequestTimeout;
+            var fds = [_]std.posix.pollfd{.{ .fd = stream.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+            const ready = std.posix.poll(&fds, @intCast(@min(left, std.math.maxInt(i32)))) catch return 0;
+            if (ready == 0) return error.RequestTimeout;
+        }
+        _ = self;
+        return streamRead(stream, tmp) catch 0;
+    }
+
+    /// Reads one HTTP request (head and Content-Length body) within
+    /// `http_request_timeout_ms`. Returns null when the peer closed first.
+    fn readHttpRequest(self: *Server, stream: std.Io.net.Stream, out: *std.ArrayListUnmanaged(u8)) !?usize {
+        var tmp: [8192]u8 = undefined;
+        const deadline: ?i64 = if (self.options.http_request_timeout_ms == 0) null else nowMs() + self.options.http_request_timeout_ms;
+        const header_end = while (true) {
+            if (std.mem.indexOf(u8, out.items, "\r\n\r\n")) |he| break he;
+            if (out.items.len > max_http_header_bytes) return error.HeadersTooLarge;
+            const n = try self.readRequestChunk(stream, &tmp, deadline);
+            if (n == 0) return null;
+            try out.appendSlice(self.allocator, tmp[0..n]);
+        };
+        var content_length: usize = 0;
+        var lines = std.mem.splitSequence(u8, out.items[0..header_end], "\r\n");
+        while (lines.next()) |line| {
+            if (std.ascii.startsWithIgnoreCase(line, "content-length:")) {
+                const val = std.mem.trim(u8, line["content-length:".len..], " ");
+                content_length = std.fmt.parseInt(usize, val, 10) catch return error.BadContentLength;
+            }
+        }
+        if (content_length > self.options.max_message_bytes) return error.BodyTooLarge;
+        const total = header_end + 4 + content_length;
+        while (out.items.len < total) {
+            const n = try self.readRequestChunk(stream, &tmp, deadline);
+            if (n == 0) return null;
+            try out.appendSlice(self.allocator, tmp[0..n]);
+        }
+        return total;
+    }
+
     fn handleHttpConnection(self: *Server, stream: std.Io.net.Stream) !void {
-        defer streamClose(stream);
+        var raw = std.ArrayListUnmanaged(u8).empty;
+        defer raw.deinit(self.allocator);
+        const total = (self.readHttpRequest(stream, &raw) catch |err| {
+            switch (err) {
+                error.HeadersTooLarge => try self.sendHttpResponse(stream, 431, "Request Header Fields Too Large", null),
+                error.BodyTooLarge => try self.sendHttpResponse(stream, 413, "Payload Too Large", null),
+                error.RequestTimeout => try self.sendHttpResponse(stream, 408, "Request Timeout", null),
+                else => try self.sendHttpResponse(stream, 400, "Bad Request", null),
+            }
+            return;
+        }) orelse return;
 
-        var buf: [8192]u8 = undefined;
-        const n = streamRead(stream, &buf) catch return;
-        if (n == 0) return;
-
-        const request_bytes = buf[0..n];
+        const request_bytes = raw.items[0..total];
 
         // Parse HTTP request
         var lines = std.mem.splitSequence(u8, request_bytes, "\r\n");
@@ -2222,7 +2552,6 @@ pub const Server = struct {
 
         // Parse headers
         var auth_header: ?[]const u8 = null;
-        var content_length: usize = 0;
         var session_id: ?[]const u8 = null;
         var origin_header: ?[]const u8 = null;
         var accept_header: ?[]const u8 = null;
@@ -2234,9 +2563,6 @@ pub const Server = struct {
 
             if (std.ascii.startsWithIgnoreCase(line, "authorization:")) {
                 auth_header = std.mem.trim(u8, line["authorization:".len..], " ");
-            } else if (std.ascii.startsWithIgnoreCase(line, "content-length:")) {
-                const val = std.mem.trim(u8, line["content-length:".len..], " ");
-                content_length = std.fmt.parseInt(usize, val, 10) catch 0;
             } else if (std.ascii.startsWithIgnoreCase(line, "mcp-session-id:")) {
                 session_id = std.mem.trim(u8, line["mcp-session-id:".len..], " ");
             } else if (std.ascii.startsWithIgnoreCase(line, "origin:")) {
@@ -2250,13 +2576,6 @@ pub const Server = struct {
                 const val = std.mem.trim(u8, line["last-event-id:".len..], " ");
                 last_event_id = std.fmt.parseInt(u64, val, 10) catch null;
             }
-        }
-
-        // GAP-010: Validate Accept header for MCP requests
-        // Currently lenient - accept header parsing is available for future strict validation
-        if (accept_header != null) {
-            // Accept header is available but not strictly validated
-            // MCP spec suggests: application/json, text/event-stream
         }
 
         // GAP-034: Validate MCP-Protocol-Version header
@@ -2288,6 +2607,9 @@ pub const Server = struct {
             return;
         }
 
+        const header_end = std.mem.indexOf(u8, request_bytes, "\r\n\r\n").?;
+        const body = request_bytes[header_end + 4 ..];
+
         // GAP-055: Handle OAuth2 Dynamic Client Registration (no auth required)
         const register_path = std.fmt.allocPrint(self.allocator, "{s}/register", .{self.options.http_path}) catch return;
         defer self.allocator.free(register_path);
@@ -2296,8 +2618,6 @@ pub const Server = struct {
                 try self.sendHttpResponse(stream, 404, "Not Found", null);
                 return;
             }
-            const header_end = std.mem.indexOf(u8, request_bytes, "\r\n\r\n") orelse return;
-            const body = request_bytes[header_end + 4 ..];
             const response = self.registerOAuthClient(body) catch {
                 try self.sendHttpResponse(stream, 400, "Bad Request", null);
                 return;
@@ -2313,57 +2633,106 @@ pub const Server = struct {
             return;
         }
 
-        // GAP-012: Validate session ID if provided
-        if (!self.isSessionValid(session_id)) {
-            try self.sendHttpResponse(stream, 404, "Not Found", null);
-            return;
-        }
-
         // GAP-029: Check rate limit
         if (!self.checkRateLimit()) {
             try self.sendHttpResponse(stream, 429, "Too Many Requests", null);
             return;
         }
 
-        // Route based on method and path
-        if (std.mem.startsWith(u8, path, self.options.http_path)) {
-            if (std.mem.eql(u8, method_str, "GET")) {
-                // SSE connection with Last-Event-ID resumption support (GAP-059)
-                try self.handleSseConnection(stream, session_id, last_event_id);
-            } else if (std.mem.eql(u8, method_str, "POST")) {
-                // Find body
-                const header_end = std.mem.indexOf(u8, request_bytes, "\r\n\r\n") orelse return;
-                const body = request_bytes[header_end + 4 ..];
-
-                const response = try self.processMessage(body);
-                if (response) |resp| {
-                    defer self.allocator.free(resp);
-                    // Session ID is owned by active_sessions map, don't free here
-                    const new_session_id = try self.generateSessionId();
-                    try self.sendHttpResponseWithSession(stream, 200, "OK", resp, new_session_id);
-                } else {
-                    try self.sendHttpResponse(stream, 202, "Accepted", null);
-                }
-            } else if (std.mem.eql(u8, method_str, "DELETE")) {
-                // GAP-008: Handle session deletion
-                if (session_id) |sid| {
-                    self.invalidateSession(sid);
-                    try self.sendHttpResponse(stream, 200, "OK", null);
-                } else {
-                    try self.sendHttpResponse(stream, 400, "Bad Request", null);
-                }
-            } else {
-                try self.sendHttpResponse(stream, 405, "Method Not Allowed", null);
-            }
-        } else {
+        if (!std.mem.startsWith(u8, path, self.options.http_path)) {
             try self.sendHttpResponse(stream, 404, "Not Found", null);
+            return;
+        }
+
+        // SONNY-6644 / GAP-012: the session named by Mcp-Session-Id. An
+        // unknown, ended or expired session gets 404.
+        var hs: ?*HttpSession = null;
+        if (session_id) |sid| {
+            hs = self.retainHttpSession(sid) orelse {
+                try self.sendHttpResponse(stream, 404, "Not Found", null);
+                return;
+            };
+        }
+        defer if (hs) |h| self.releaseHttpSession(h);
+
+        if (std.mem.eql(u8, method_str, "POST")) {
+            if (hs == null) {
+                // Only initialize may come without a session; it creates
+                // one. Anything else gets 400 (Streamable HTTP, "Session
+                // Management").
+                if (!isInitializeMessage(self.allocator, body)) {
+                    try self.sendHttpResponse(stream, 400, "Bad Request", null);
+                    return;
+                }
+                hs = try self.createHttpSession();
+            }
+            const accepts_sse = if (accept_header) |acc| std.mem.indexOf(u8, acc, "text/event-stream") != null else false;
+            try self.servePost(stream, hs.?, body, accepts_sse);
+        } else if (std.mem.eql(u8, method_str, "GET")) {
+            const h = hs orelse {
+                try self.sendHttpResponse(stream, 400, "Bad Request", null);
+                return;
+            };
+            try self.serveGetStream(stream, h, last_event_id);
+        } else if (std.mem.eql(u8, method_str, "DELETE")) {
+            // GAP-008: Handle session deletion
+            const h = hs orelse {
+                try self.sendHttpResponse(stream, 400, "Bad Request", null);
+                return;
+            };
+            self.closeHttpSession(h);
+            try self.sendHttpResponse(stream, 200, "OK", null);
+        } else {
+            try self.sendHttpResponse(stream, 405, "Method Not Allowed", null);
         }
     }
 
-    fn handleSseConnection(self: *Server, stream: std.Io.net.Stream, session_id: ?[]const u8, last_event_id: ?u64) !void {
-        // Send SSE headers
-        const headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n";
-        try streamWriteAll(stream, headers);
+    /// True when `body` is a single JSON-RPC `initialize` request.
+    fn isInitializeMessage(allocator: Allocator, body: []const u8) bool {
+        var err_info = json.ParseError.init();
+        var doc = json.parse(allocator, body, .{}, &err_info) catch return false;
+        defer doc.deinit();
+        if (doc.root != .obj) return false;
+        for (doc.root.obj) |m| {
+            if (std.mem.eql(u8, m.k, "method")) return m.v == .str and std.mem.eql(u8, m.v.str, "initialize");
+        }
+        return false;
+    }
+
+    /// Dispatches one POSTed message for `hs`. Messages the server sends to
+    /// the client while serving it (server-to-client requests, progress,
+    /// logs) travel on this POST's own SSE stream, opened on first use, and
+    /// the response follows as the stream's last event. Without such
+    /// messages the response is plain JSON (202 for notifications and
+    /// responses).
+    fn servePost(self: *Server, stream: std.Io.net.Stream, hs: *HttpSession, body: []const u8, accepts_sse: bool) !void {
+        var ps = PostStream{ .stream = stream, .session = hs, .accepts_sse = accepts_sse };
+        const previous = dispatch_ctx;
+        dispatch_ctx = .{ .http = hs, .post = &ps };
+        const response = blk: {
+            defer dispatch_ctx = previous;
+            break :blk try self.processMessage(body);
+        };
+        defer if (response) |r| self.allocator.free(r);
+
+        if (ps.started) {
+            if (response) |r| try ps.sendEvent(r);
+            return; // closing the connection ends the stream
+        }
+        if (response) |r| {
+            try self.sendHttpResponseWithSession(stream, 200, "OK", r, hs.id);
+        } else {
+            try self.sendHttpResponseWithSession(stream, 202, "Accepted", null, hs.id);
+        }
+    }
+
+    /// The session's standalone GET stream (Streamable HTTP "Listening for
+    /// Messages from the Server"). It replays this session's events after
+    /// Last-Event-ID, then stays open until the client goes away, the
+    /// session ends, or the server stops. A new GET replaces the old stream,
+    /// so each message is sent on one stream only.
+    fn serveGetStream(self: *Server, stream: std.Io.net.Stream, hs: *HttpSession, last_event_id: ?u64) !void {
+        try writeSseHead(stream, hs.id);
 
         // Send retry field (GAP-060) to hint reconnection delay to clients
         if (self.options.sse_retry_ms > 0) {
@@ -2372,31 +2741,177 @@ pub const Server = struct {
             streamWriteAll(stream, retry_msg) catch {};
         }
 
-        // GAP-059: Replay missed events if Last-Event-ID was provided
-        if (last_event_id) |after_id| {
-            var replay_events: [64]SseEventBuffer.Event = undefined;
-            const count = self.sse_event_buffer.getEventsAfter(after_id, &replay_events, 64);
-            for (replay_events[0..count]) |event| {
-                // Replay the event with its original ID
-                var msg_buf: [128]u8 = undefined;
-                const header = std.fmt.bufPrint(&msg_buf, "id: {d}\ndata: ", .{event.id}) catch continue;
-                streamWriteAll(stream, header) catch continue;
-                streamWriteAll(stream, event.data) catch continue;
-                streamWriteAll(stream, "\n\n") catch continue;
+        {
+            hs.stream_mutex.lockUncancelable(io());
+            defer hs.stream_mutex.unlock(io());
+
+            // A DELETE that raced this GET has already shut the session's
+            // streams down; do not register a new one it would never close.
+            if (self.isSessionClosed(hs)) return;
+
+            // GAP-059: replay this session's missed events.
+            if (last_event_id) |after_id| {
+                var replay_events: [64]SseEventBuffer.Event = undefined;
+                const count = hs.events.getEventsAfter(after_id, &replay_events, 64);
+                for (replay_events[0..count]) |event| {
+                    writeSseEvent(stream, event.id, event.data) catch break;
+                }
+            }
+            if (hs.get_stream) |old| old.shutdown(io(), .both) catch {};
+            hs.get_stream = stream;
+        }
+        defer {
+            hs.stream_mutex.lockUncancelable(io());
+            defer hs.stream_mutex.unlock(io());
+            if (hs.get_stream) |cur| {
+                if (cur.socket.handle == stream.socket.handle) hs.get_stream = null;
             }
         }
 
-        // Create SSE connection entry
-        const conn = try self.allocator.create(SseConnection);
-        conn.* = .{
-            .stream = stream,
-            .session_id = try self.allocator.dupe(u8, session_id orelse ""),
-            .allocator = self.allocator,
-        };
+        var sink: [256]u8 = undefined;
+        while (true) {
+            const n = streamRead(stream, &sink) catch break;
+            if (n == 0) break;
+        }
+    }
 
-        self.sse_mutex.lockUncancelable(io());
-        try self.sse_connections.append(self.allocator, conn);
-        self.sse_mutex.unlock(io());
+    // ------------------------------------------------------------------
+    // Session table (SONNY-6644)
+    // ------------------------------------------------------------------
+
+    fn createHttpSession(self: *Server) !*HttpSession {
+        const hs = try self.allocator.create(HttpSession);
+        errdefer self.allocator.destroy(hs);
+
+        // Cryptographically secure session ID (GAP-007): 128 random bits as
+        // 32 hex digits (visible ASCII only).
+        var random_bytes: [16]u8 = undefined;
+        io().random(&random_bytes);
+        const id = try std.fmt.allocPrint(self.allocator, "{x:0>32}", .{std.mem.readInt(u128, &random_bytes, .big)});
+        errdefer self.allocator.free(id);
+
+        hs.* = .{
+            .server = self,
+            .id = id,
+            .refs = 1,
+            .last_active_ms = nowMs(),
+            .session = Session.init(self.allocator, self),
+        };
+        hs.session.http = hs;
+
+        self.sessions_mutex.lockUncancelable(io());
+        defer self.sessions_mutex.unlock(io());
+        try self.http_sessions.put(self.allocator, hs.id, hs);
+        return hs;
+    }
+
+    /// The live session with `id`, with a reference taken, or null.
+    fn retainHttpSession(self: *Server, id: []const u8) ?*HttpSession {
+        self.expireIdleSessions();
+        self.sessions_mutex.lockUncancelable(io());
+        defer self.sessions_mutex.unlock(io());
+        const hs = self.http_sessions.get(id) orelse return null;
+        if (hs.closed) return null;
+        hs.refs += 1;
+        hs.last_active_ms = nowMs();
+        return hs;
+    }
+
+    fn releaseHttpSession(self: *Server, hs: *HttpSession) void {
+        const destroy = blk: {
+            self.sessions_mutex.lockUncancelable(io());
+            defer self.sessions_mutex.unlock(io());
+            hs.refs -= 1;
+            hs.last_active_ms = nowMs();
+            break :blk hs.refs == 0 and hs.closed;
+        };
+        if (destroy) self.destroyHttpSession(hs);
+    }
+
+    fn isSessionClosed(self: *Server, hs: *HttpSession) bool {
+        self.sessions_mutex.lockUncancelable(io());
+        defer self.sessions_mutex.unlock(io());
+        return hs.closed;
+    }
+
+    /// Ends a session (DELETE or expiry): its id stops resolving, its GET
+    /// stream is closed and its pending server-to-client requests fail.
+    fn closeHttpSession(self: *Server, hs: *HttpSession) void {
+        const destroy = blk: {
+            self.sessions_mutex.lockUncancelable(io());
+            defer self.sessions_mutex.unlock(io());
+            if (!hs.closed) {
+                hs.closed = true;
+                _ = self.http_sessions.remove(hs.id);
+            }
+            break :blk hs.refs == 0;
+        };
+        {
+            hs.stream_mutex.lockUncancelable(io());
+            defer hs.stream_mutex.unlock(io());
+            if (hs.get_stream) |s| s.shutdown(io(), .both) catch {};
+        }
+        hs.session.failPending(error.NoSession);
+        if (destroy) self.destroyHttpSession(hs);
+    }
+
+    /// Drops sessions idle for longer than `http_session_idle_timeout_ms`
+    /// with no connection or `SessionRef` holding them.
+    fn expireIdleSessions(self: *Server) void {
+        const timeout = self.options.http_session_idle_timeout_ms;
+        if (timeout == 0) return;
+        const now = nowMs();
+        var expired: [16]*HttpSession = undefined;
+        var n: usize = 0;
+        {
+            self.sessions_mutex.lockUncancelable(io());
+            defer self.sessions_mutex.unlock(io());
+            var it = self.http_sessions.valueIterator();
+            while (it.next()) |hs| {
+                if (n == expired.len) break;
+                if (hs.*.refs == 0 and now - hs.*.last_active_ms > timeout) {
+                    expired[n] = hs.*;
+                    n += 1;
+                }
+            }
+            for (expired[0..n]) |hs| {
+                hs.closed = true;
+                _ = self.http_sessions.remove(hs.id);
+            }
+        }
+        for (expired[0..n]) |hs| self.destroyHttpSession(hs);
+    }
+
+    fn destroyHttpSession(self: *Server, hs: *HttpSession) void {
+        hs.session.deinit();
+        hs.requests.deinit(self.allocator);
+        hs.client.deinit(self.allocator);
+        hs.events.deinit();
+        self.allocator.free(hs.id);
+        self.allocator.destroy(hs);
+    }
+
+    /// The Streamable HTTP client the current handler call is serving, with
+    /// a reference taken so it can be reached later (from any thread) via
+    /// `enterSession`. Null outside an HTTP request (stdio has one client).
+    pub fn retainCurrentSession(self: *Server) ?SessionRef {
+        const hs = dispatch_ctx.http orelse return null;
+        self.sessions_mutex.lockUncancelable(io());
+        defer self.sessions_mutex.unlock(io());
+        if (hs.closed) return null;
+        hs.refs += 1;
+        return .{ .session = hs };
+    }
+
+    /// Makes the calling thread act for `ref`'s client until `exit`:
+    /// notifications and server-to-client requests go to that client's
+    /// GET stream only, and fail with `error.NoSession` once the session
+    /// has ended.
+    pub fn enterSession(self: *Server, ref: SessionRef) SessionScope {
+        _ = self;
+        const scope = SessionScope{ .previous = dispatch_ctx };
+        dispatch_ctx = .{ .http = ref.session, .post = null };
+        return scope;
     }
 
     fn checkOrigin(self: *Server, origin: ?[]const u8) bool {
@@ -2694,63 +3209,13 @@ pub const Server = struct {
         return buf.toOwnedSlice(self.allocator);
     }
 
-    fn generateSessionId(self: *Server) ![]const u8 {
-        // Generate cryptographically secure session ID (GAP-007)
-        var random_bytes: [16]u8 = undefined;
-        io().random(&random_bytes);
-
-        // Convert to hex string (32 chars)
-        var hex_buf: [32]u8 = undefined;
-        _ = std.fmt.bufPrint(&hex_buf, "{x:0>32}", .{std.mem.readInt(u128, &random_bytes, .big)}) catch unreachable;
-
-        const session_id = try self.allocator.dupe(u8, &hex_buf);
-
-        // Register the session (GAP-011)
-        self.sessions_mutex.lockUncancelable(io());
-        defer self.sessions_mutex.unlock(io());
-        self.active_sessions.put(self.allocator, session_id, {}) catch {};
-
-        return session_id;
-    }
-
-    /// Invalidate a session (GAP-008)
-    fn invalidateSession(self: *Server, session_id: []const u8) void {
-        self.sessions_mutex.lockUncancelable(io());
-        defer self.sessions_mutex.unlock(io());
-
-        // Remove from active sessions
-        if (self.active_sessions.fetchRemove(session_id)) |entry| {
-            self.allocator.free(entry.key);
-        }
-
-        // Close any SSE connections for this session
-        self.sse_mutex.lockUncancelable(io());
-        defer self.sse_mutex.unlock(io());
-
-        var i: usize = 0;
-        while (i < self.sse_connections.items.len) {
-            const conn = self.sse_connections.items[i];
-            if (std.mem.eql(u8, conn.session_id, session_id)) {
-                conn.deinit();
-                _ = self.sse_connections.orderedRemove(i);
-            } else {
-                i += 1;
-            }
-        }
-    }
-
-    /// Check if a session ID is valid (GAP-012)
-    fn isSessionValid(self: *Server, session_id: ?[]const u8) bool {
-        if (session_id == null) return true; // No session header = OK (first request)
-
-        self.sessions_mutex.lockUncancelable(io());
-        defer self.sessions_mutex.unlock(io());
-        return self.active_sessions.contains(session_id.?);
-    }
-
     /// Check rate limit, returns true if request is allowed (GAP-029)
     fn checkRateLimit(self: *Server) bool {
         if (self.options.rate_limit_requests_per_second == 0) return true; // Unlimited
+
+        // Connections are served concurrently (SONNY-6644).
+        self.rate_mutex.lockUncancelable(io());
+        defer self.rate_mutex.unlock(io());
 
         const now = std.Io.Timestamp.now(io(), .real).toMilliseconds();
         const elapsed_ms = now - self.rate_limit_last_refill;
@@ -2800,48 +3265,34 @@ pub const Server = struct {
         return true;
     }
 
-    /// Cancel a request by ID (GAP-024). String and integer ids are
-    /// distinct: "7" does not match 7.
-    fn cancelRequest(self: *Server, request_id: RequestId) void {
-        self.requests_mutex.lockUncancelable(io());
-        defer self.requests_mutex.unlock(io());
+    /// The registry of the client being served (SONNY-6644).
+    fn currentRegistry(self: *Server) *RequestRegistry {
+        if (dispatch_ctx.http) |hs| return &hs.requests;
+        return &self.requests;
+    }
 
-        const info = switch (request_id) {
-            .int => |i| self.active_requests.get(i),
-            .str => |str| self.active_string_requests.get(str),
-        };
-        if (info) |i| i.token.cancelByPeer();
+    /// Cancel a request by ID (GAP-024), in the current client's registry.
+    fn cancelRequest(self: *Server, request_id: RequestId) void {
+        self.currentRegistry().cancel(request_id);
     }
 
     /// Register a request for cancellation/timeout tracking (GAP-024, GAP-005).
-    /// Returns `error.DuplicateRequestId`, leaving the existing entry alone,
-    /// when a request with the same id is still in flight.
     fn registerRequest(self: *Server, request_id: RequestId, token: *CancelToken) error{ DuplicateRequestId, OutOfMemory }!void {
-        self.requests_mutex.lockUncancelable(io());
-        defer self.requests_mutex.unlock(io());
-        const info: RequestInfo = .{
-            .token = token,
-            .start_time = std.Io.Timestamp.now(io(), .real).toMilliseconds(),
-        };
-        switch (request_id) {
-            .int => |i| {
-                const gop = try self.active_requests.getOrPut(self.allocator, i);
-                if (gop.found_existing) return error.DuplicateRequestId;
-                gop.value_ptr.* = info;
-            },
-            .str => |str| {
-                const gop = try self.active_string_requests.getOrPut(self.allocator, str);
-                if (gop.found_existing) return error.DuplicateRequestId;
-                gop.value_ptr.* = info;
-            },
-        }
+        return self.currentRegistry().register(self.allocator, request_id, token);
+    }
+
+    /// Unregister a request after completion (GAP-024)
+    fn unregisterRequest(self: *Server, request_id: RequestId) void {
+        self.currentRegistry().unregister(request_id);
     }
 
     /// Delivers the client's response to the server-to-client request with
-    /// `id` (SONNY-6643). `result` null means the client answered with an
-    /// error. Unknown or already-answered ids are ignored.
+    /// `id` (SONNY-6643), in the session of the client that sent it, so one
+    /// client cannot answer another's request (SONNY-6644). `result` null
+    /// means the client answered with an error. Unknown or already-answered
+    /// ids are ignored.
     fn resolveClientResponse(self: *Server, id: i64, result: ?json.Value) void {
-        const s = if (self.session) |*sess| sess else return;
+        const s = self.currentSession() orelse return;
         s.mutex.lockUncancelable(io());
         defer s.mutex.unlock(io());
         const entry = s.pending_requests.fetchRemove(id) orelse return;
@@ -2857,38 +3308,17 @@ pub const Server = struct {
         ctx.done.set(io());
     }
 
-    /// Unregister a request after completion (GAP-024)
-    fn unregisterRequest(self: *Server, request_id: RequestId) void {
-        self.requests_mutex.lockUncancelable(io());
-        defer self.requests_mutex.unlock(io());
-        switch (request_id) {
-            .int => |i| _ = self.active_requests.remove(i),
-            .str => |str| _ = self.active_string_requests.remove(str),
-        }
-    }
-
-    /// Check and timeout stale requests (GAP-005)
+    /// Check and timeout stale requests (GAP-005), for every client.
     pub fn checkRequestTimeouts(self: *Server) void {
         if (self.options.request_timeout_ms == 0) return; // Timeouts disabled
-
-        self.requests_mutex.lockUncancelable(io());
-        defer self.requests_mutex.unlock(io());
-
         const now = std.Io.Timestamp.now(io(), .real).toMilliseconds();
         const timeout_ms: i64 = @intCast(self.options.request_timeout_ms);
+        self.requests.expire(now, timeout_ms);
 
-        var iter = self.active_requests.iterator();
-        while (iter.next()) |entry| {
-            if (now - entry.value_ptr.start_time > timeout_ms) {
-                entry.value_ptr.token.cancel();
-            }
-        }
-        var str_iter = self.active_string_requests.iterator();
-        while (str_iter.next()) |entry| {
-            if (now - entry.value_ptr.start_time > timeout_ms) {
-                entry.value_ptr.token.cancel();
-            }
-        }
+        self.sessions_mutex.lockUncancelable(io());
+        defer self.sessions_mutex.unlock(io());
+        var it = self.http_sessions.valueIterator();
+        while (it.next()) |hs| hs.*.requests.expire(now, timeout_ms);
     }
 
     fn sendHttpResponse(self: *Server, stream: std.Io.net.Stream, status: u16, status_text: []const u8, body: ?[]const u8) !void {
@@ -2912,7 +3342,7 @@ pub const Server = struct {
         }
     }
 
-    fn sendHttpResponseWithSession(self: *Server, stream: std.Io.net.Stream, status: u16, status_text: []const u8, body: []const u8, session_id: []const u8) !void {
+    fn sendHttpResponseWithSession(self: *Server, stream: std.Io.net.Stream, status: u16, status_text: []const u8, body: ?[]const u8, session_id: []const u8) !void {
         _ = self;
         var buf: [4096]u8 = undefined;
         var fbs: std.Io.Writer = .fixed(&buf);
@@ -2922,9 +3352,10 @@ pub const Server = struct {
         try fbs.print("Mcp-Session-Id: {s}\r\n", .{session_id});
         // GAP-034: MCP-Protocol-Version header
         try fbs.print("MCP-Protocol-Version: {s}\r\n", .{ProtocolVersion});
-        try fbs.print("Content-Length: {d}\r\n\r\n", .{body.len});
+        const b = body orelse "";
+        try fbs.print("Content-Length: {d}\r\n\r\n", .{b.len});
         try streamWriteAll(stream, fbs.buffered());
-        try streamWriteAll(stream, body);
+        try streamWriteAll(stream, b);
     }
 
     pub fn processMessage(self: *Server, data: []const u8) !?[]const u8 {
@@ -3047,9 +3478,14 @@ pub const Server = struct {
                 item: json.Value,
                 index: usize,
                 results: []BatchItemResult,
+                /// The client the batch came from (SONNY-6644).
+                dispatch: DispatchContext,
 
                 fn run(ctx_: *anyopaque, _: *tp.TaskContext) void {
                     const c: *@This() = @ptrCast(@alignCast(ctx_));
+                    const previous = dispatch_ctx;
+                    dispatch_ctx = c.dispatch;
+                    defer dispatch_ctx = previous;
                     const response = c.server.processJsonValue(c.item) catch null;
                     c.results[c.index] = .{ .response = response, .index = c.index };
                 }
@@ -3063,7 +3499,7 @@ pub const Server = struct {
             var n_tasks: usize = 0;
             for (items, 0..) |item, i| {
                 if (skip[i]) continue;
-                ctxs[n_tasks] = .{ .server = self, .item = item, .index = i, .results = results };
+                ctxs[n_tasks] = .{ .server = self, .item = item, .index = i, .results = results, .dispatch = dispatch_ctx };
                 tasks[n_tasks] = .{ .task_fn = ItemCtx.run, .ctx = &ctxs[n_tasks] };
                 n_tasks += 1;
             }
@@ -3317,13 +3753,13 @@ pub const Server = struct {
         } else if (std.mem.eql(u8, method, "ping")) {
             return .{ .result = "{}", .owned = false };
         } else if (std.mem.eql(u8, method, "notifications/initialized")) {
-            self.initialized = true;
+            self.clientState().initialized.* = true;
             return .{ .result = null, .owned = false };
         }
 
         // GAP-004: Block non-exempt requests before initialized
         // Allowed before init: initialize, ping, notifications/initialized, logging/*
-        if (!self.initialized) {
+        if (!self.clientState().initialized.*) {
             if (!std.mem.startsWith(u8, method, "logging/") and
                 !std.mem.startsWith(u8, method, "notifications/"))
             {
@@ -3441,6 +3877,8 @@ pub const Server = struct {
     }
 
     fn handleInitialize(self: *Server, params: ?json.Value) ![]const u8 {
+        // The state of the client being served (SONNY-6644).
+        const state = self.clientState();
         // Parse client capabilities and version (GAP-001, GAP-002)
         if (params) |p| {
             if (p == .obj) {
@@ -3451,52 +3889,52 @@ pub const Server = struct {
                             // member.v.str points into the parsed message,
                             // which is freed when this request completes.
                             const version = try self.allocator.dupe(u8, member.v.str);
-                            if (self.client_protocol_version) |old| self.allocator.free(old);
-                            self.client_protocol_version = version;
+                            if (state.protocol_version.*) |old| self.allocator.free(old);
+                            state.protocol_version.* = version;
                         }
                     } else if (std.mem.eql(u8, member.k, "capabilities")) {
                         if (member.v == .obj) {
                             for (member.v.obj) |cap| {
                                 if (std.mem.eql(u8, cap.k, "roots")) {
-                                    self.client_capabilities.roots = true;
+                                    state.capabilities.roots = true;
                                     if (cap.v == .obj) {
                                         for (cap.v.obj) |root_cap| {
                                             if (std.mem.eql(u8, root_cap.k, "listChanged")) {
                                                 if (root_cap.v == .bool) {
-                                                    self.client_capabilities.roots_list_changed = root_cap.v.bool;
+                                                    state.capabilities.roots_list_changed = root_cap.v.bool;
                                                 }
                                             }
                                         }
                                     }
                                 } else if (std.mem.eql(u8, cap.k, "sampling")) {
-                                    self.client_capabilities.sampling = true;
+                                    state.capabilities.sampling = true;
                                     // GAP-057/058: Parse nested sampling capabilities
                                     if (cap.v == .obj) {
                                         for (cap.v.obj) |samp_cap| {
                                             if (std.mem.eql(u8, samp_cap.k, "tools")) {
                                                 if (samp_cap.v == .bool) {
-                                                    self.client_capabilities.sampling_tools = samp_cap.v.bool;
+                                                    state.capabilities.sampling_tools = samp_cap.v.bool;
                                                 } else {
-                                                    self.client_capabilities.sampling_tools = true;
+                                                    state.capabilities.sampling_tools = true;
                                                 }
                                             } else if (std.mem.eql(u8, samp_cap.k, "context")) {
                                                 if (samp_cap.v == .bool) {
-                                                    self.client_capabilities.sampling_context = samp_cap.v.bool;
+                                                    state.capabilities.sampling_context = samp_cap.v.bool;
                                                 } else {
-                                                    self.client_capabilities.sampling_context = true;
+                                                    state.capabilities.sampling_context = true;
                                                 }
                                             }
                                         }
                                     }
                                 } else if (std.mem.eql(u8, cap.k, "elicitation")) {
                                     // GAP-041: Parse elicitation capability
-                                    self.client_capabilities.elicitation = true;
+                                    state.capabilities.elicitation = true;
                                 } else if (std.mem.eql(u8, cap.k, "experimental")) {
                                     // GAP-026: Store experimental capabilities as raw JSON
                                     if (cap.v == .obj) {
                                         const experimental = json.stringify(self.allocator, cap.v) catch null;
-                                        if (self.client_capabilities.experimental) |old| self.allocator.free(old);
-                                        self.client_capabilities.experimental = experimental;
+                                        if (state.capabilities.experimental) |old| self.allocator.free(old);
+                                        state.capabilities.experimental = experimental;
                                     }
                                 }
                             }
@@ -3506,7 +3944,10 @@ pub const Server = struct {
             }
         }
 
-        // Return cached response if available
+        // Return cached response if available. Connections are served
+        // concurrently, so build it at most once.
+        self.init_mutex.lockUncancelable(io());
+        defer self.init_mutex.unlock(io());
         if (self.cached_init_response) |cached| {
             return cached;
         }
@@ -3871,9 +4312,49 @@ pub const Server = struct {
         self.allocator.free(response);
     }
 
+    /// The state of the client being served: the HTTP session's when
+    /// dispatching for one, else the server's own (stdio / processMessage).
+    fn clientState(self: *Server) ClientStateRef {
+        if (dispatch_ctx.http) |hs| return .{
+            .initialized = &hs.client.initialized,
+            .capabilities = &hs.client.capabilities,
+            .protocol_version = &hs.client.protocol_version,
+        };
+        return .{
+            .initialized = &self.initialized,
+            .capabilities = &self.client_capabilities,
+            .protocol_version = &self.client_protocol_version,
+        };
+    }
+
+    /// The server-to-client request session of the client being served.
+    fn currentSession(self: *Server) ?*Session {
+        if (dispatch_ctx.http) |hs| {
+            return if (self.isSessionClosed(hs)) null else &hs.session;
+        }
+        return if (self.session) |*s| s else null;
+    }
+
+    /// Sends one JSON-RPC message to the client being served.
     fn sendToClient(self: *Server, data: []const u8) !void {
-        // Send via stdout for stdio transport using buffered writer (Zig 0.15 API)
+        return self.deliver(dispatch_ctx.http, data);
+    }
+
+    /// Sends one JSON-RPC message to `target` (an HTTP client), or over
+    /// stdio when null. Never broadcasts (SONNY-6644): an HTTP message goes
+    /// on the stream of the request being served for that client, else on
+    /// that client's GET stream. With no client to send to it fails with
+    /// `error.NoSession`.
+    fn deliver(self: *Server, target: ?*HttpSession, data: []const u8) !void {
+        if (target) |hs| {
+            if (self.isSessionClosed(hs)) return error.NoSession;
+            if (dispatch_ctx.post) |ps| {
+                if (ps.session == hs and ps.accepts_sse) return ps.sendEvent(data);
+            }
+            return hs.sendOnGetStream(data);
+        }
         if (self.stdout_writer_wrap) |*writer| {
+            // Send via stdout for stdio transport using buffered writer (Zig 0.15 API)
             try writer.interface.writeAll(data);
             try writer.interface.writeByte('\n');
             try writer.interface.flush();
@@ -3881,22 +4362,36 @@ pub const Server = struct {
             // Legacy unbuffered fallback
             try writer.interface.writeAll(data);
             try writer.interface.writeByte('\n');
+        } else {
+            return error.NoSession;
+        }
+    }
+
+    /// A notification meant for every client (list_changed): one copy over
+    /// stdio, and one copy on each HTTP client's own GET stream.
+    fn sendNotificationToAll(self: *Server, method: []const u8) !void {
+        const notification = try buildMessageJson(self.allocator, null, method, null);
+        defer self.allocator.free(notification);
+
+        if (self.stdout_writer_wrap != null or self.stdout_writer != null) {
+            try self.deliver(null, notification);
         }
 
-        // Send via SSE for HTTP transport
-        self.sse_mutex.lockUncancelable(io());
-        defer self.sse_mutex.unlock(io());
-
-        // GAP-009: Include event ID for resumability
-        const event_id = self.sse_event_id.fetchAdd(1, .monotonic);
-
-        // GAP-059: Store event in ring buffer for Last-Event-ID resumption
-        self.sse_event_buffer.store(self.allocator, event_id, data);
-
-        for (self.sse_connections.items) |conn| {
-            const sse_msg = try std.fmt.allocPrint(self.allocator, "id: {d}\ndata: {s}\n\n", .{ event_id, data });
-            defer self.allocator.free(sse_msg);
-            streamWriteAll(conn.stream, sse_msg) catch {};
+        var targets = std.ArrayListUnmanaged(*HttpSession).empty;
+        defer targets.deinit(self.allocator);
+        {
+            self.sessions_mutex.lockUncancelable(io());
+            defer self.sessions_mutex.unlock(io());
+            var it = self.http_sessions.valueIterator();
+            while (it.next()) |hs| {
+                if (hs.*.closed) continue;
+                try targets.append(self.allocator, hs.*);
+                hs.*.refs += 1;
+            }
+        }
+        for (targets.items) |hs| {
+            hs.sendOnGetStream(notification) catch {};
+            self.releaseHttpSession(hs);
         }
     }
 };
