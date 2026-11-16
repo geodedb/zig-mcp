@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `client_protocol_version` pointed into the parsed `initialize` message, which is freed when the request completes; it is now a server-owned copy. The `experimental` client capabilities JSON leaked on every `initialize` and is now freed.
 - `requestElicitation` (message, and the url in url mode) and `requestSamplingFull` (`systemPrompt`, `stopSequences`, `toolChoice`, `includeContext`) escape every control character, not only `\n`, `\r` and `\t`; the url was not escaped at all.
 - `Session.request` did not compile (`waitTimeout` was passed an `Io.Duration` instead of an `Io.Clock.Duration`), so any program that called `requestSampling`, `requestSamplingFull`, `requestRoots` or `requestElicitation` failed to build.
+- The CI `fuzz` job ran `zig build test --fuzz`, which found no fuzz tests (and, once one exists, the Zig 0.16.0 std test runner does not compile in fuzz mode), so it failed on every run behind `allow_failure`. It now runs the mutation fuzzer over a new `dispatch` target (real `processMessage` round trips: valid single-line JSON, notifications unanswered, no leaks) and the `jsonrpc` target, and fails on a violation. The same property runs over a corpus in `zig build test` (`tests/fuzz_dispatch.zig`). `zig build fuzz` with an unknown `--target` now exits non-zero.
 
 ### Added
 

@@ -4,6 +4,8 @@
 //! - JSON-RPC message parsing
 //! - WebSocket frame parsing
 //! - HTTP header parsing
+//! - The JSON-RPC dispatcher (`--target dispatch`, see
+//!   tests/dispatch_fuzz_target.zig)
 //!
 //! Usage:
 //!   zig build fuzz -- --corpus corpus/ --iterations 1000000
@@ -11,6 +13,7 @@
 const std = @import("std");
 const json = @import("json");
 const mcp = @import("mcp");
+const dispatch_target = @import("dispatch_fuzz_target.zig");
 
 /// Fuzz test result
 pub const FuzzResult = struct {
@@ -324,6 +327,15 @@ pub fn fuzzJsonRpcParse(input: []const u8) void {
     }
 }
 
+/// Fuzz target for the JSON-RPC dispatcher: a real `Server.processMessage`
+/// round trip per input. Panics (non-zero exit) when a response is not one
+/// valid single-line JSON value, a notification is answered, or memory leaks.
+pub fn fuzzDispatch(input: []const u8) void {
+    dispatch_target.checkOne(input) catch |err| {
+        std.debug.panic("dispatch fuzz target failed: {s}", .{@errorName(err)});
+    };
+}
+
 /// Fuzz target for WebSocket frame parsing
 pub fn fuzzWebSocketFrame(input: []const u8) void {
     if (input.len < 2) return;
@@ -466,10 +478,12 @@ pub fn main(init: std.process.Init) !void {
         fuzzWebSocketFrame
     else if (std.mem.eql(u8, target_name, "http"))
         fuzzHttpHeaders
+    else if (std.mem.eql(u8, target_name, "dispatch"))
+        fuzzDispatch
     else {
         std.debug.print("Unknown target: {s}\n", .{target_name});
         printUsage();
-        return;
+        return error.UnknownTarget;
     };
 
     std.debug.print("MCP Fuzz Tester\n", .{});
@@ -495,7 +509,7 @@ fn printUsage() void {
         \\Usage: fuzz [options]
         \\
         \\Options:
-        \\  --target <name>    Target: json, jsonrpc, websocket, http (default: json)
+        \\  --target <name>    Target: json, jsonrpc, websocket, http, dispatch (default: json)
         \\  --corpus <dir>     Corpus directory for seed inputs
         \\  --iterations <n>   Number of iterations (default: 1000000)
         \\  --seed <n>         Random seed (0 = random)
@@ -537,6 +551,13 @@ test "websocket fuzz target" {
     fuzzWebSocketFrame(&[_]u8{ 0x81, 0x05, 'h', 'e', 'l', 'l', 'o' });
     fuzzWebSocketFrame(&[_]u8{ 0x88, 0x00 });
     fuzzWebSocketFrame("");
+}
+
+test "dispatch fuzz target" {
+    fuzzDispatch("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}");
+    fuzzDispatch("{\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"params\":{\"name\":\"x\"}}");
+    fuzzDispatch("not json");
+    fuzzDispatch("");
 }
 
 test "http fuzz target" {
