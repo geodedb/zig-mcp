@@ -3,7 +3,7 @@
 //! Tests for MCP spec revision 2025-03-26 compliance:
 //! T1: stdio init+initialized+ping
 //! T2: stdio batch of 2 pings
-//! T3: stdio batch of 2 tools/call to barrier (proves parallelism)
+//! T3: stdio batch of 2 tools/call to a test-only barrier tool (proves parallelism)
 //! T4: HTTP bearer auth
 //! T5: HTTP oauth2 well-known endpoint
 
@@ -211,16 +211,72 @@ test "T2: stdio batch of 2 pings" {
 // T3: stdio batch of 2 tools/call to barrier => proves parallelism
 // ============================================================================
 
+/// Test-only handler whose "barrier" tool returns only once `count` calls
+/// are inside it at the same time. Calls processed one after another never
+/// meet, so each gives up after a bounded wait and fails.
+const BarrierHandler = struct {
+    allocator: std.mem.Allocator,
+    arrived: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+    fn handler(self: *BarrierHandler) mcp.Handler {
+        var h = mcp.DemoHandler.init(self.allocator);
+        var base = h.handler();
+        base.ctx = @ptrCast(self);
+        base.listTools = listTools;
+        base.callTool = callTool;
+        base.listResources = listResources;
+        base.listResourceTemplates = listResourceTemplates;
+        base.listPrompts = listPrompts;
+        base.complete = complete;
+        return base;
+    }
+
+    fn alloc(ctx: ?*anyopaque) std.mem.Allocator {
+        const self: *BarrierHandler = @ptrCast(@alignCast(ctx.?));
+        return self.allocator;
+    }
+
+    fn callTool(ctx: ?*anyopaque, name: []const u8, _: []const u8, _: *const mcp.CancelToken) anyerror![]const u8 {
+        const self: *BarrierHandler = @ptrCast(@alignCast(ctx.?));
+        if (!std.mem.eql(u8, name, "barrier")) return error.ToolNotFound;
+        const target: u32 = 2;
+        _ = self.arrived.fetchAdd(1, .acq_rel);
+        var waited_ms: u32 = 0;
+        while (self.arrived.load(.acquire) < target) : (waited_ms += 1) {
+            if (waited_ms >= 5000) return error.BarrierTimeout;
+            _io().sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+        }
+        return self.allocator.dupe(u8, "{\"content\":[{\"type\":\"text\",\"text\":\"barrier passed\"}]}");
+    }
+
+    fn listTools(ctx: ?*anyopaque, _: ?[]const u8) anyerror![]const u8 {
+        return alloc(ctx).dupe(u8, "{\"tools\":[]}");
+    }
+    fn listResources(ctx: ?*anyopaque, _: ?[]const u8) anyerror![]const u8 {
+        return alloc(ctx).dupe(u8, "{\"resources\":[]}");
+    }
+    fn listResourceTemplates(ctx: ?*anyopaque) anyerror![]const u8 {
+        return alloc(ctx).dupe(u8, "{\"resourceTemplates\":[]}");
+    }
+    fn listPrompts(ctx: ?*anyopaque, _: ?[]const u8) anyerror![]const u8 {
+        return alloc(ctx).dupe(u8, "{\"prompts\":[]}");
+    }
+    fn complete(ctx: ?*anyopaque, _: []const u8) anyerror![]const u8 {
+        return alloc(ctx).dupe(u8, "{\"completion\":{\"values\":[]}}");
+    }
+};
+
 test "T3: batch barrier calls prove parallelism" {
     const allocator = std.testing.allocator;
 
-    // Create server with worker threads for parallel processing
-    var demo_handler = mcp.DemoHandler.init(allocator);
+    // Create server with worker threads for parallel processing. The
+    // barrier tool lives in this test's handler, not in the library.
+    var barrier_handler = BarrierHandler{ .allocator = allocator };
     var server = try mcp.Server.init(allocator, .{
         .name = "test-server",
         .version = "1.0.0",
         .worker_threads = 2,
-    }, demo_handler.handler());
+    }, barrier_handler.handler());
     defer server.deinit();
 
     // Initialize the server first (required before other requests)
@@ -235,12 +291,9 @@ test "T3: batch barrier calls prove parallelism" {
     ;
     _ = try server.processMessage(initialized_notification);
 
-    // The barrier tool waits until N concurrent calls arrive
-    // If requests are processed sequentially, it would deadlock
-    // Success proves parallel handling
-
-    // For this test, we'll use the server's built-in barrier handling
-    // which uses atomic counters to prove parallelism
+    // The barrier tool waits until 2 concurrent calls arrive. Processed
+    // sequentially, each call times out with an error instead, so two
+    // results prove parallel handling.
 
     // Send batch of 2 barrier calls
     const batch_request =

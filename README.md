@@ -16,7 +16,6 @@ A Zig 0.15.2 implementation of the [Model Context Protocol (MCP)](https://modelc
 - **Transports** - stdio (newline-delimited) and Streamable HTTP with SSE
 - **Authentication** - Bearer, Basic, and OAuth2.1 with embedded endpoints
 - **Parallel Handling** - Worker thread pool with cancellation support
-- **Deterministic Testing** - Barrier tool for proving parallelism without timing
 
 ## Protocol Version
 
@@ -101,7 +100,10 @@ pub const ServerOptions = struct {
 
 pub const CancelToken = struct {
     pub fn isCancelled(self: *const CancelToken) bool;
+    pub fn isCancelledByPeer(self: *const CancelToken) bool;
 };
+
+pub fn setErrorDetail(allocator: std.mem.Allocator, message: []const u8, data_json: ?[]const u8) error{ InvalidErrorData, OutOfMemory }!void;
 
 pub const Session = struct {
     pub fn notify(self: *Session, method: []const u8, params_json: ?[]const u8) anyerror!void;
@@ -143,6 +145,41 @@ with that allocator, never a string literal or a slice the handler keeps:
 error hands nothing over. Versions 0.1.12 to 0.1.21 freed only `callTool`
 results (and leaked the others); see CHANGELOG.md.
 
+### Handler errors
+
+A callback reports a failure by returning an error; the error picks the
+JSON-RPC code. `error.ToolNotFound` and `error.PromptNotFound` are `-32602`
+(Invalid params) and `error.ResourceNotFound` is `-32002`, as MCP 2025-11-25
+specifies; `error.InvalidParams` is `-32602`, `error.MethodNotFound` is
+`-32601`, and any other error is `-32603`. The message defaults to the error
+name. To send a better message, or `data`, call `mcp.setErrorDetail` before
+returning the error:
+
+```zig
+const msg = try std.fmt.allocPrint(allocator, "Unknown tool: {s}", .{name});
+defer allocator.free(msg);
+try mcp.setErrorDetail(allocator, msg, null);
+return error.ToolNotFound;
+```
+
+`setErrorDetail(allocator, message, data_json)` copies both with
+`allocator`, and the server frees the copies. `data_json` must be one JSON
+value, such as `{"uri":"file:///x"}`, or `setErrorDetail` returns
+`error.InvalidErrorData`. The message and string ids are JSON-escaped in
+every response.
+
+The server never answers a notification (a message without an `id`), even
+when it fails. A `tools/call` request (string or integer id) is cancelled when
+the client sends `notifications/cancelled` for it: `cancel.isCancelled()`
+becomes true, and if the handler then returns `error.Cancelled` no response
+is sent. A request whose `id` is present but is not a string or an integer
+is answered with `-32600` (Invalid Request) and a null id.
+
+A successful result must be exactly one JSON value. The server re-serialises
+it without insignificant whitespace, so a pretty-printed result cannot break
+the newline-delimited stdio transport; a result that is not one JSON value is
+answered with `-32603` and the message `Invalid handler result`.
+
 ## Testing
 
 ```bash
@@ -159,7 +196,7 @@ zig build test-accept
 |------|-------------|
 | T1 | stdio init+initialized+ping => correct responses |
 | T2 | stdio batch of 2 pings => ordered batch response |
-| T3 | stdio batch of 2 barrier calls => proves parallelism |
+| T3 | stdio batch of 2 calls to a test-only barrier tool => proves parallelism |
 | T4 | HTTP bearer: 401 without auth, 200 with token + session ID |
 | T5 | HTTP oauth2: well-known endpoint returns metadata |
 
@@ -292,8 +329,8 @@ Apache-2.0 License - see [LICENSE](LICENSE) for details.
 ## Rationale
 
 - Single-file design minimizes module complexity for MCP server use case
-- Handler callbacks return JSON strings for zero-copy response embedding
-- Barrier tool uses atomics for deterministic parallelism proof without timing
+- Handler callbacks return JSON strings, which the server validates and re-serialises compactly into the response
+- The parallelism acceptance test (T3) uses a barrier tool defined in the test, not in the library
 - OAuth2.1 metadata endpoint enables client autodiscovery
 - SSE connections tracked per session for server→client messaging
 - Thread pool workers check shutdown flag at 1ms intervals for responsive stop
