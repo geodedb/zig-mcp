@@ -245,15 +245,49 @@ try transport.write(response);
 ### HTTP Transport
 
 ```zig
-const http = try mcp.HttpTransport.init(allocator, .{
-    .bind_address = "0.0.0.0",
-    .port = 8080,
-});
-defer http.deinit();
-
-// Start server
-const port = try http.start();
+var server = try mcp.Server.init(allocator, .{
+    .name = "my-server",
+    .version = "1.0.0",
+    .http_port = 8080,
+}, handler);
+defer server.deinit();
+const port = try server.serveHttp();
 ```
+
+`Server.serveHttp()` implements the MCP 2025-11-25 Streamable HTTP
+transport with one session per client:
+
+- `POST` an `initialize` request without `Mcp-Session-Id` to start a
+  session; the response carries a random `Mcp-Session-Id` that stays the
+  same for the session. Every other request must send it: without one the
+  server answers `400`, with an unknown, deleted or expired one `404`.
+- Initialization state, capabilities, request ids, cancellations, tasks and
+  server-to-client requests are per session. Two clients may use the same
+  request id, and one client cannot cancel, answer or read anything that
+  belongs to another.
+- Messages the server sends while handling a POSTed request (for example
+  `requestRoots`, `requestSampling`, `emitLog`, `notifyProgress` called from
+  a handler) go on that POST's SSE stream when the client accepts
+  `text/event-stream`, followed by the response. Otherwise they go on the
+  session's `GET` stream, which stays open until the client disconnects, the
+  session ends or the server stops; a new `GET` replaces the previous one.
+  Nothing is sent to more than one stream, and nothing is sent to another
+  client. `Last-Event-ID` replays only the session's own events.
+- `notifyToolListChanged`, `notifyResourceListChanged` and
+  `notifyPromptListChanged` send one copy to each client's `GET` stream.
+  Other messages need a session: from outside a request, take one with
+  `const ref = server.retainCurrentSession()` while handling a request, then
+  `const scope = server.enterSession(ref); defer scope.exit();` and send.
+  Release the `SessionRef` when done; `deinit` waits for outstanding
+  references (up to 10 s, then it panics). Without a session
+  the call fails with `error.NoSession` and nothing is sent.
+- `DELETE` with `Mcp-Session-Id` ends the session: its `GET` stream closes
+  and its pending server-to-client requests fail. Sessions with no open
+  connection expire after `http_session_idle_timeout_ms` (default 30
+  minutes, 0 = never).
+- Connections are served concurrently, up to `http_max_connections` (then
+  `503`). A request must arrive in full within `http_request_timeout_ms`
+  (then `408`).
 
 ### WebSocket Transport
 
