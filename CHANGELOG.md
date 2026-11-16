@@ -38,6 +38,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **BREAKING for handler authors:** every `Handler` callback that returns `[]const u8` (`listTools`, `callTool`, `listResources`, `readResource`, `listResourceTemplates`, `listPrompts`, `getPrompt`, `complete`) transfers ownership of the slice to the server, which frees it with the allocator passed to `Server.init`. Returning a string literal, a slice the handler keeps, or bytes from another allocator is now an invalid free. Migrate by returning `allocator.dupe(u8, text)` for fixed text. A callback that returns an error hands nothing over. The contract is documented on `Handler` ("Result Ownership"), in README.md and docs/api.md. `DemoHandler` and `cmd/mcp-server` follow it.
 
+## [0.1.21] - 2026-10-12
+
+### Changed
+
+- CI: scope the gitleaks exceptions for the public OpenSSL release signers and add a regression script that keeps negative controls blocked (SONNY-4910); cancel obsolete branch pipelines (SONNY-4907).
+
+## [0.1.20] - 2026-10-12
+
+### Changed
+
+- Bump otel to v0.1.28 (verified TLS dependency closure).
+
+## [0.1.19] - 2026-10-12
+
+### Changed
+
+- Bump otel to v0.1.27.
+
+## [0.1.18] - 2026-10-12
+
+### Changed
+
+- Update dependencies: json v0.1.20, thread_pool v0.2.9, otel v0.1.26, and the lazy fips v0.1.3 backend.
+- `DemoHandler` carries its allocator per instance through `Handler.ctx` instead of a package-level global.
+
+## [0.1.17] - 2026-09-19
+
+### Changed
+
+- Bump otel to v0.1.24 (GAP-0838 diamond sync).
+
+## [0.1.16] - 2026-09-19
+
+### Changed
+
+- Bump otel to v0.1.21 (GAP-0838 diamond sync).
+
 ## [0.1.15] - 2026-09-15
 
 ### Changed
@@ -129,7 +166,15 @@ Initial open source release of the MCP Server Library for Zig.
 - Gitleaks allowlist configuration for test data
 - Apache-2.0 open source licensing
 
-[Unreleased]: https://gitlab.com/devnw/zig/mcp/-/compare/v0.1.14...HEAD
+[Unreleased]: https://gitlab.com/devnw/zig/mcp/-/compare/v0.1.22...HEAD
+[0.1.22]: https://gitlab.com/devnw/zig/mcp/-/compare/v0.1.21...v0.1.22
+[0.1.21]: https://gitlab.com/devnw/zig/mcp/-/compare/v0.1.20...v0.1.21
+[0.1.20]: https://gitlab.com/devnw/zig/mcp/-/compare/v0.1.19...v0.1.20
+[0.1.19]: https://gitlab.com/devnw/zig/mcp/-/compare/v0.1.18...v0.1.19
+[0.1.18]: https://gitlab.com/devnw/zig/mcp/-/compare/v0.1.17...v0.1.18
+[0.1.17]: https://gitlab.com/devnw/zig/mcp/-/compare/v0.1.16...v0.1.17
+[0.1.16]: https://gitlab.com/devnw/zig/mcp/-/compare/v0.1.15...v0.1.16
+[0.1.15]: https://gitlab.com/devnw/zig/mcp/-/compare/v0.1.14...v0.1.15
 [0.1.14]: https://gitlab.com/devnw/zig/mcp/-/compare/v0.1.13...v0.1.14
 [0.1.13]: https://gitlab.com/devnw/zig/mcp/-/compare/v0.1.12...v0.1.13
 [0.1.12]: https://gitlab.com/devnw/zig/mcp/-/compare/v0.1.0...v0.1.12
