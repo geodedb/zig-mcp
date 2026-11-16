@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.24] - 2026-11-15
+
 ### Fixed
 
 - A client's response to a server-to-client request was answered with `-32600` "Missing method" and never delivered, so `requestRoots`, `requestSampling`, `requestSamplingFull` and `requestElicitation` always timed out (SONNY-6643). `processMessage` now treats a message with no `method` and a `result` or an `error` as a response (MCP 2025-11-25 basic "Responses"): it resolves the pending request and is never answered. Responses to unknown or already answered ids, with a string id, or with both or neither of `result` and `error` are dropped silently. A response that races the timeout is returned instead of leaked.
@@ -179,7 +181,8 @@ Initial open source release of the MCP Server Library for Zig.
 - Gitleaks allowlist configuration for test data
 - Apache-2.0 open source licensing
 
-[Unreleased]: https://gitlab.com/devnw/zig/mcp/-/compare/v0.1.23...HEAD
+[Unreleased]: https://gitlab.com/devnw/zig/mcp/-/compare/v0.1.24...HEAD
+[0.1.24]: https://gitlab.com/devnw/zig/mcp/-/compare/v0.1.23...v0.1.24
 [0.1.23]: https://gitlab.com/devnw/zig/mcp/-/compare/v0.1.22...v0.1.23
 [0.1.22]: https://gitlab.com/devnw/zig/mcp/-/compare/v0.1.21...v0.1.22
 [0.1.21]: https://gitlab.com/devnw/zig/mcp/-/compare/v0.1.20...v0.1.21
