@@ -1039,12 +1039,21 @@ pub const Session = struct {
         }
     }
 
+    /// Sends a notification to the client. `method` is JSON-escaped;
+    /// `params_json`, when given, must be exactly one JSON value (it is sent
+    /// minified) or `error.InvalidParamsJson` is returned and nothing is sent.
     pub fn notify(self: *Session, method: []const u8, params_json: ?[]const u8) anyerror!void {
         const notification = try self.buildNotification(method, params_json);
         defer self.allocator.free(notification);
         try self.server.sendToClient(notification);
     }
 
+    /// Sends a request to the client and waits up to `timeout_ms` for its
+    /// response, which `Server.processMessage` delivers when the client's
+    /// reply arrives. Returns the `result` as minified JSON, allocated with
+    /// the session allocator (the caller frees it); `error.ClientError` when
+    /// the client answered with a JSON-RPC error; `error.Timeout` when no
+    /// response arrived. `params_json` follows the `notify` rules.
     pub fn request(self: *Session, method: []const u8, params_json: ?[]const u8, timeout_ms: u32) anyerror![]const u8 {
         // Observability seam: wrap the round-trip in a client-side RPC
         // span. The seam is null-tracer-safe (no panic when otel isn't
@@ -1057,6 +1066,11 @@ pub const Session = struct {
 
         const id = self.next_request_id.fetchAdd(1, .monotonic);
 
+        // Build (and validate) the request before registering it, so a bad
+        // params_json leaves nothing pending.
+        const req = try self.buildRequest(id, method, params_json);
+        defer self.allocator.free(req);
+
         var ctx = RequestContext{ .id = id };
 
         {
@@ -1064,58 +1078,44 @@ pub const Session = struct {
             defer self.mutex.unlock(io());
             try self.pending_requests.put(id, &ctx);
         }
-        defer {
+        var removed = false;
+        defer if (!removed) {
             self.mutex.lockUncancelable(io());
             defer self.mutex.unlock(io());
             _ = self.pending_requests.remove(id);
-        }
+        };
 
-        const req = try self.buildRequest(id, method, params_json);
-        defer self.allocator.free(req);
         try self.server.sendToClient(req);
 
-        // Wait for response with timeout
+        // Wait for the client's response (resolved by Server.resolveClientResponse).
         const timeout_ns: u64 = @as(u64, timeout_ms) * std.time.ns_per_ms;
-        ctx.done.waitTimeout(io(), .{ .duration = .{ .raw = std.Io.Duration.fromNanoseconds(@intCast(timeout_ns)), .clock = .awake } }) catch return error.Timeout;
+        const timed_out = if (ctx.done.waitTimeout(io(), .{ .duration = .{ .raw = std.Io.Duration.fromNanoseconds(@intCast(timeout_ns)), .clock = .awake } })) false else |_| true;
 
+        // Deregister under the mutex: once it is released no response can
+        // touch ctx, so a response that raced the timeout is returned (and
+        // not leaked).
+        {
+            self.mutex.lockUncancelable(io());
+            defer self.mutex.unlock(io());
+            _ = self.pending_requests.remove(id);
+            removed = true;
+        }
+
+        if (ctx.response) |response| {
+            observability.endRpcClientSpan(__obs_span, true, 0);
+            return response;
+        }
         if (ctx.err) |e| return e;
-        const response = ctx.response orelse return error.NoResponse;
-        observability.endRpcClientSpan(__obs_span, true, 0);
-        return response;
+        if (timed_out) return error.Timeout;
+        return error.NoResponse;
     }
 
     fn buildNotification(self: *Session, method: []const u8, params_json: ?[]const u8) ![]u8 {
-        var buf = std.ArrayListUnmanaged(u8).empty;
-        errdefer buf.deinit(self.allocator);
-
-        try buf.appendSlice(self.allocator, "{\"jsonrpc\":\"2.0\",\"method\":\"");
-        try buf.appendSlice(self.allocator, method);
-        try buf.append(self.allocator, '"');
-        if (params_json) |p| {
-            try buf.appendSlice(self.allocator, ",\"params\":");
-            try buf.appendSlice(self.allocator, p);
-        }
-        try buf.append(self.allocator, '}');
-
-        return buf.toOwnedSlice(self.allocator);
+        return buildMessageJson(self.allocator, null, method, params_json);
     }
 
     fn buildRequest(self: *Session, id: i64, method: []const u8, params_json: ?[]const u8) ![]u8 {
-        var buf = std.ArrayListUnmanaged(u8).empty;
-        errdefer buf.deinit(self.allocator);
-
-        try buf.appendSlice(self.allocator, "{\"jsonrpc\":\"2.0\",\"id\":");
-        try buf.print(self.allocator, "{d}", .{id});
-        try buf.appendSlice(self.allocator, ",\"method\":\"");
-        try buf.appendSlice(self.allocator, method);
-        try buf.append(self.allocator, '"');
-        if (params_json) |p| {
-            try buf.appendSlice(self.allocator, ",\"params\":");
-            try buf.appendSlice(self.allocator, p);
-        }
-        try buf.append(self.allocator, '}');
-
-        return buf.toOwnedSlice(self.allocator);
+        return buildMessageJson(self.allocator, id, method, params_json);
     }
 };
 
@@ -1467,6 +1467,33 @@ fn appendCompactJson(allocator: Allocator, buf: *std.ArrayListUnmanaged(u8), raw
     };
     defer allocator.free(compact);
     try buf.appendSlice(allocator, compact);
+}
+
+/// Appends caller-supplied `params_json` minified, or returns
+/// `error.InvalidParamsJson` when it is not exactly one JSON value.
+fn appendParamsJson(allocator: Allocator, buf: *std.ArrayListUnmanaged(u8), raw: []const u8) !void {
+    appendCompactJson(allocator, buf, raw) catch |e| switch (e) {
+        error.InvalidHandlerResult => return error.InvalidParamsJson,
+        else => |other| return other,
+    };
+}
+
+/// Builds a server-to-client JSON-RPC request (`id` set) or notification.
+/// `method` is escaped and `params_json` validated (see `appendParamsJson`).
+fn buildMessageJson(allocator: Allocator, id: ?i64, method: []const u8, params_json: ?[]const u8) ![]u8 {
+    var buf = std.ArrayListUnmanaged(u8).empty;
+    errdefer buf.deinit(allocator);
+
+    try buf.appendSlice(allocator, "{\"jsonrpc\":\"2.0\",");
+    if (id) |i| try buf.print(allocator, "\"id\":{d},", .{i});
+    try buf.appendSlice(allocator, "\"method\":");
+    try appendJsonString(allocator, &buf, method);
+    if (params_json) |p| {
+        try buf.appendSlice(allocator, ",\"params\":");
+        try appendParamsJson(allocator, &buf, p);
+    }
+    try buf.append(allocator, '}');
+    return buf.toOwnedSlice(allocator);
 }
 
 /// Appends `s` as a JSON string literal: quotes, backslashes and control
@@ -1914,9 +1941,9 @@ pub const Server = struct {
     pub fn notifyResourceUpdated(self: *Server, uri: []const u8) !void {
         var buf = std.ArrayListUnmanaged(u8).empty;
         errdefer buf.deinit(self.allocator);
-        try buf.appendSlice(self.allocator, "{\"uri\":\"");
-        try buf.appendSlice(self.allocator, uri);
-        try buf.appendSlice(self.allocator, "\"}");
+        try buf.appendSlice(self.allocator, "{\"uri\":");
+        try appendJsonString(self.allocator, &buf, uri);
+        try buf.append(self.allocator, '}');
         const params = try buf.toOwnedSlice(self.allocator);
         defer self.allocator.free(params);
         try self.sendNotification("notifications/resources/updated", params);
@@ -1931,13 +1958,13 @@ pub const Server = struct {
     pub fn emitLog(self: *Server, level: []const u8, logger: []const u8, message: []const u8) !void {
         var buf = std.ArrayListUnmanaged(u8).empty;
         errdefer buf.deinit(self.allocator);
-        try buf.appendSlice(self.allocator, "{\"level\":\"");
-        try buf.appendSlice(self.allocator, level);
-        try buf.appendSlice(self.allocator, "\",\"logger\":\"");
-        try buf.appendSlice(self.allocator, logger);
-        try buf.appendSlice(self.allocator, "\",\"data\":{\"message\":\"");
-        try buf.appendSlice(self.allocator, message);
-        try buf.appendSlice(self.allocator, "\"}}");
+        try buf.appendSlice(self.allocator, "{\"level\":");
+        try appendJsonString(self.allocator, &buf, level);
+        try buf.appendSlice(self.allocator, ",\"logger\":");
+        try appendJsonString(self.allocator, &buf, logger);
+        try buf.appendSlice(self.allocator, ",\"data\":{\"message\":");
+        try appendJsonString(self.allocator, &buf, message);
+        try buf.appendSlice(self.allocator, "}}");
         const params = try buf.toOwnedSlice(self.allocator);
         defer self.allocator.free(params);
         try self.sendNotification("notifications/message", params);
@@ -2112,9 +2139,9 @@ pub const Server = struct {
     pub fn notifyProgress(self: *Server, progress_token: []const u8, progress: u32, total: ?u32) !void {
         var buf = std.ArrayListUnmanaged(u8).empty;
         errdefer buf.deinit(self.allocator);
-        try buf.appendSlice(self.allocator, "{\"progressToken\":\"");
-        try buf.appendSlice(self.allocator, progress_token);
-        try buf.appendSlice(self.allocator, "\",\"progress\":");
+        try buf.appendSlice(self.allocator, "{\"progressToken\":");
+        try appendJsonString(self.allocator, &buf, progress_token);
+        try buf.appendSlice(self.allocator, ",\"progress\":");
         try buf.print(self.allocator, "{d}", .{progress});
         if (total) |t| {
             try buf.appendSlice(self.allocator, ",\"total\":");
@@ -2127,19 +2154,7 @@ pub const Server = struct {
     }
 
     fn sendNotification(self: *Server, method: []const u8, params: ?[]const u8) !void {
-        var buf = std.ArrayListUnmanaged(u8).empty;
-        errdefer buf.deinit(self.allocator);
-
-        try buf.appendSlice(self.allocator, "{\"jsonrpc\":\"2.0\",\"method\":\"");
-        try buf.appendSlice(self.allocator, method);
-        try buf.append(self.allocator, '"');
-        if (params) |p| {
-            try buf.appendSlice(self.allocator, ",\"params\":");
-            try buf.appendSlice(self.allocator, p);
-        }
-        try buf.append(self.allocator, '}');
-
-        const notification = try buf.toOwnedSlice(self.allocator);
+        const notification = try buildMessageJson(self.allocator, null, method, params);
         defer self.allocator.free(notification);
         try self.sendToClient(notification);
     }
@@ -2798,8 +2813,10 @@ pub const Server = struct {
         if (info) |i| i.token.cancelByPeer();
     }
 
-    /// Register a request for cancellation/timeout tracking (GAP-024, GAP-005)
-    fn registerRequest(self: *Server, request_id: RequestId, token: *CancelToken) void {
+    /// Register a request for cancellation/timeout tracking (GAP-024, GAP-005).
+    /// Returns `error.DuplicateRequestId`, leaving the existing entry alone,
+    /// when a request with the same id is still in flight.
+    fn registerRequest(self: *Server, request_id: RequestId, token: *CancelToken) error{ DuplicateRequestId, OutOfMemory }!void {
         self.requests_mutex.lockUncancelable(io());
         defer self.requests_mutex.unlock(io());
         const info: RequestInfo = .{
@@ -2807,9 +2824,37 @@ pub const Server = struct {
             .start_time = std.Io.Timestamp.now(io(), .real).toMilliseconds(),
         };
         switch (request_id) {
-            .int => |i| self.active_requests.put(self.allocator, i, info) catch {},
-            .str => |str| self.active_string_requests.put(self.allocator, str, info) catch {},
+            .int => |i| {
+                const gop = try self.active_requests.getOrPut(self.allocator, i);
+                if (gop.found_existing) return error.DuplicateRequestId;
+                gop.value_ptr.* = info;
+            },
+            .str => |str| {
+                const gop = try self.active_string_requests.getOrPut(self.allocator, str);
+                if (gop.found_existing) return error.DuplicateRequestId;
+                gop.value_ptr.* = info;
+            },
         }
+    }
+
+    /// Delivers the client's response to the server-to-client request with
+    /// `id` (SONNY-6643). `result` null means the client answered with an
+    /// error. Unknown or already-answered ids are ignored.
+    fn resolveClientResponse(self: *Server, id: i64, result: ?json.Value) void {
+        const s = if (self.session) |*sess| sess else return;
+        s.mutex.lockUncancelable(io());
+        defer s.mutex.unlock(io());
+        const entry = s.pending_requests.fetchRemove(id) orelse return;
+        const ctx = entry.value;
+        if (result) |r| {
+            ctx.response = json.stringify(s.allocator, r) catch |e| blk: {
+                ctx.err = e;
+                break :blk null;
+            };
+        } else {
+            ctx.err = error.ClientError;
+        }
+        ctx.done.set(io());
     }
 
     /// Unregister a request after completion (GAP-024)
@@ -3061,6 +3106,8 @@ pub const Server = struct {
         var method: ?[]const u8 = null;
         var params: ?json.Value = null;
         var has_jsonrpc = false;
+        var result: ?json.Value = null;
+        var has_error = false;
 
         for (obj) |member| {
             if (std.mem.eql(u8, member.k, "jsonrpc")) {
@@ -3083,7 +3130,24 @@ pub const Server = struct {
                 }
             } else if (std.mem.eql(u8, member.k, "params")) {
                 params = member.v;
+            } else if (std.mem.eql(u8, member.k, "result")) {
+                result = member.v;
+            } else if (std.mem.eql(u8, member.k, "error")) {
+                has_error = true;
             }
+        }
+
+        // A message with no method but a result or an error is the client's
+        // response to a server-to-client request (MCP basic "Responses").
+        // It resolves the pending request, if any, and is never answered.
+        if (method == null and (result != null or has_error)) {
+            if (has_jsonrpc and !id_invalid and (result != null) != has_error) {
+                if (id) |rid| switch (rid) {
+                    .int => |i| self.resolveClientResponse(i, result),
+                    .str => {}, // the server only issues integer ids
+                };
+            }
+            return null;
         }
 
         if (!has_jsonrpc or id_invalid) {
@@ -3103,12 +3167,21 @@ pub const Server = struct {
         defer __obs_span.end(null);
         errdefer observability.endRpcServerSpan(__obs_span, false, JsonRpcError.InternalError);
 
-        // GAP-024: make a tools/call request cancellable by the client's
-        // notifications/cancelled while it runs.
+        // GAP-024: track every request while it runs, so tools/call can be
+        // cancelled by the client's notifications/cancelled and a second
+        // request reusing an in-flight id is rejected instead of replacing
+        // the first (SONNY-6643; MCP: a requestor MUST NOT reuse an id).
         var cancel = CancelToken{};
-        const cancel_id: ?RequestId = if (id != null and std.mem.eql(u8, method.?, "tools/call")) id else null;
-        if (cancel_id) |cid| self.registerRequest(cid, &cancel);
-        defer if (cancel_id) |cid| self.unregisterRequest(cid);
+        if (id) |rid| {
+            self.registerRequest(rid, &cancel) catch |err| switch (err) {
+                error.DuplicateRequestId => {
+                    observability.endRpcServerSpan(__obs_span, false, JsonRpcError.InvalidRequest);
+                    return @as(?[]const u8, try self.makeErrorResponse(id, JsonRpcError.InvalidRequest, "Duplicate request id"));
+                },
+                else => |e| return e,
+            };
+        }
+        defer if (id) |rid| self.unregisterRequest(rid);
 
         // A detail left on this thread outside a dispatch must not be
         // attached to this request's error (SONNY-6585).

@@ -419,8 +419,8 @@ pub fn build(b: *std.Build) void {
     const run_ownership_test = b.addRunArtifact(ownership_test);
     test_step.dependOn(&run_ownership_test.step);
 
-    // JSON-RPC error semantics, wire-safety and dispatcher fuzz tests
-    // (SONNY-6585). tests/fuzz_dispatch.zig runs its corpus here and is the
+    // JSON-RPC error semantics, wire-safety, client-response and dispatcher
+    // fuzz tests (SONNY-6585, SONNY-6643). tests/fuzz_dispatch.zig runs its corpus here and is the
     // target `zig build test --fuzz` mutates.
     const test_errors_step = b.step("test-errors", "Run JSON-RPC error semantics and wire-safety tests only");
     for ([_][]const u8{
@@ -429,6 +429,7 @@ pub fn build(b: *std.Build) void {
         "tests/wire_safety.zig",
         "tests/outbound_escaping.zig",
         "tests/fuzz_dispatch.zig",
+        "tests/client_responses.zig",
     }) |path| {
         const errors_test_mod = b.createModule(.{
             .root_source_file = b.path(path),

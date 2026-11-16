@@ -93,36 +93,43 @@ Development roadmap for the MCP (Model Context Protocol) Zig library.
 ## Phase 5: Advanced Features (Complete)
 
 ### Resource Subscriptions
+
 - [x] Subscribe/unsubscribe handling
 - [x] Change notification generation
 - [x] Subscription state management
 
 ### Sampling (GAP-056-058)
+
 - [x] Sampling request handling
 - [x] Full parameter support (systemPrompt, temperature, tools, etc.)
 - [x] sampling.tools capability
 - [x] sampling.context capability
 
 ### Logging (GAP-020)
+
 - [x] Log level management
 - [x] Structured log messages
 - [x] Log notification routing
 
 ### Progress Reporting (GAP-023)
+
 - [x] Progress token handling
 - [x] Progress notifications
 - [x] Cancellation support (GAP-024)
 
 ### Roots (GAP-015, GAP-021)
+
 - [x] Root listing request
 - [x] Root change notifications handling
 
 ### Tasks System (GAP-035-040)
+
 - [x] Task capability declaration
 - [x] Task-augmented requests
 - [x] tasks/get, tasks/list, tasks/cancel, tasks/result
 
 ### List Changed Notifications (GAP-016-019)
+
 - [x] notifications/resources/list_changed
 - [x] notifications/resources/updated
 - [x] notifications/prompts/list_changed
@@ -131,15 +138,18 @@ Development roadmap for the MCP (Model Context Protocol) Zig library.
 ## Phase 6: Production Hardening (Complete)
 
 ### Performance
+
 - [x] Parallel request handling with worker thread pool
 - [x] Cached initialize response
 
 ### Reliability
+
 - [x] Request timeout handling (GAP-005)
 - [x] Graceful degradation
 - [x] Error recovery
 
 ### Security
+
 - [x] Input validation (GAP-030)
 - [x] Rate limiting (GAP-029)
 - [x] Authentication (Bearer, Basic, OAuth2.1)
@@ -149,23 +159,27 @@ Development roadmap for the MCP (Model Context Protocol) Zig library.
 - [x] Client ID Metadata Documents (GAP-053)
 
 ### Error Handling (GAP-031-032)
+
 - [x] Specific error codes (ResourceNotFound, ToolNotFound, etc.)
 - [x] Error data field support
 
 ## Phase 7: Transport Enhancements (Complete)
 
 ### Transport Enhancements
+
 - [x] Buffered I/O optimization (Zig 0.15 API)
 - [x] HTTP client (for outbound connections)
 - [x] Connection pooling (built into std.http.Client)
 - [x] WebSocket transport (RFC 6455 frames, upgrade, ping/pong)
 
 ### Performance
+
 - [x] Arena allocator support (RequestArena)
 - [ ] Zero-copy parsing where possible
 - [ ] Request pipelining
 
 ### Observability
+
 - [x] Metrics collection (Prometheus format)
 - [x] Tracing support (spans and timing)
 - [x] Health checks (JSON status)
@@ -174,19 +188,23 @@ Development roadmap for the MCP (Model Context Protocol) Zig library.
 ## Phase 8: Remaining Items (Planned)
 
 ### Security
+
 - [ ] TLS support for transports
 
 ### CLI Tools
+
 - [ ] MCP server runner
 - [ ] Protocol inspector
 - [ ] Test client
 
 ### Documentation
+
 - [ ] API documentation generation
 - [ ] Example gallery
 - [ ] Migration guides
 
 ### Testing
+
 - [ ] Protocol conformance tests
 - [ ] Fuzz testing
 - [ ] Performance benchmarks
