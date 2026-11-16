@@ -1208,6 +1208,9 @@ pub const Task = struct {
     poll_interval_ms: u32,
     result: ?[]const u8, // Stored result JSON when completed
     method: []const u8, // Original method name
+    /// Mcp-Session-Id of the Streamable HTTP client that created the task,
+    /// null for stdio. Only that client can see it (SONNY-6644).
+    owner: ?[]const u8 = null,
 
     pub fn toJson(self: *const Task, allocator: Allocator) ![]const u8 {
         var buf = std.ArrayListUnmanaged(u8).empty;
@@ -2026,6 +2029,13 @@ pub const Server = struct {
 
         // Clean up active requests (GAP-024)
         self.requests.deinit(self.allocator);
+
+        // Tasks (GAP-035-040) were never freed.
+        {
+            var it = self.tasks.valueIterator();
+            while (it.next()) |task| self.freeTask(task);
+            self.tasks.deinit(self.allocator);
+        }
 
         if (self.session) |*s| {
             s.deinit();
@@ -4020,6 +4030,7 @@ pub const Server = struct {
             .poll_interval_ms = self.options.tasks_poll_interval_ms,
             .result = null,
             .method = try self.allocator.dupe(u8, method),
+            .owner = if (dispatch_ctx.http) |hs| try self.allocator.dupe(u8, hs.id) else null,
         };
 
         self.tasks_mutex.lockUncancelable(io());
@@ -4027,6 +4038,30 @@ pub const Server = struct {
 
         try self.tasks.put(self.allocator, task_id, task);
         return self.tasks.getPtr(task_id).?;
+    }
+
+    /// Whether the client being served may see `task`: tasks belong to the
+    /// HTTP session that created them (SONNY-6644).
+    fn taskVisible(task: *const Task) bool {
+        const current: ?[]const u8 = if (dispatch_ctx.http) |hs| hs.id else null;
+        if (task.owner) |owner| {
+            return if (current) |c| std.mem.eql(u8, owner, c) else false;
+        }
+        return current == null;
+    }
+
+    /// The task with `task_id` if the client being served may see it.
+    /// Call with `tasks_mutex` held.
+    fn visibleTask(self: *Server, task_id: []const u8) ?*Task {
+        const task = self.tasks.getPtr(task_id) orelse return null;
+        return if (taskVisible(task)) task else null;
+    }
+
+    fn freeTask(self: *Server, task: *Task) void {
+        if (task.result) |r| self.allocator.free(r);
+        if (task.owner) |o| self.allocator.free(o);
+        self.allocator.free(task.method);
+        self.allocator.free(task.id);
     }
 
     /// Get task by ID
@@ -4045,6 +4080,7 @@ pub const Server = struct {
             task.status = status;
             task.last_updated = std.Io.Timestamp.now(io(), .real).toMilliseconds();
             if (result) |r| {
+                if (task.result) |old| self.allocator.free(old);
                 task.result = self.allocator.dupe(u8, r) catch null;
             }
         }
@@ -4055,7 +4091,7 @@ pub const Server = struct {
         self.tasks_mutex.lockUncancelable(io());
         defer self.tasks_mutex.unlock(io());
 
-        if (self.tasks.getPtr(task_id)) |task| {
+        if (self.visibleTask(task_id)) |task| {
             return @as(?[]const u8, try task.toJson(self.allocator));
         }
         return error.InvalidParams; // Task not found
@@ -4092,6 +4128,7 @@ pub const Server = struct {
 
         var iter = self.tasks.iterator();
         while (iter.next()) |entry| {
+            if (!taskVisible(entry.value_ptr)) continue;
             try entries.append(self.allocator, .{
                 .id = entry.key_ptr.*,
                 .created_at = entry.value_ptr.created_at,
@@ -4153,7 +4190,7 @@ pub const Server = struct {
         self.tasks_mutex.lockUncancelable(io());
         defer self.tasks_mutex.unlock(io());
 
-        if (self.tasks.getPtr(task_id)) |task| {
+        if (self.visibleTask(task_id)) |task| {
             if (!task.status.isTerminal()) {
                 task.status = .cancelled;
                 task.last_updated = std.Io.Timestamp.now(io(), .real).toMilliseconds();
@@ -4174,7 +4211,7 @@ pub const Server = struct {
                 self.tasks_mutex.lockUncancelable(io());
                 defer self.tasks_mutex.unlock(io());
 
-                if (self.tasks.getPtr(task_id)) |task| {
+                if (self.visibleTask(task_id)) |task| {
                     if (task.status.isTerminal()) {
                         if (task.result) |result| {
                             return @as(?[]const u8, try self.allocator.dupe(u8, result));
