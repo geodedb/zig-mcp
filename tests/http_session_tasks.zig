@@ -33,7 +33,8 @@ const TaskHandler = struct {
     fn callTool(ctx: ?*anyopaque, name: []const u8, _: []const u8, _: *const mcp.CancelToken) anyerror![]const u8 {
         const self = self_(ctx);
         if (std.mem.eql(u8, name, "start_task")) {
-            const task = try self.server.createTask("tools/call", null);
+            var task = try self.server.createTask("tools/call", null);
+            defer task.deinit(self.allocator);
             self.server.updateTaskStatus(task.id, .completed, "{\"secret\":\"of-a\"}");
             return std.fmt.allocPrint(self.allocator, "{{\"content\":[{{\"type\":\"text\",\"text\":\"{s}\"}}]}}", .{task.id});
         }
