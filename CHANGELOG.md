@@ -20,6 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The request body was a single 8 KiB read with `Content-Length` ignored. The server now reads the full declared body, up to `max_message_bytes` (`413`) with headers up to 16 KiB (`431`), within `http_request_timeout_ms` (default 30 s, `408`).
 - `DELETE` closes the session's stream and fails its pending server-to-client requests. Sessions idle for `http_session_idle_timeout_ms` (default 30 minutes) with no open connection expire.
 - Tasks were never freed, and `updateTaskStatus` leaked the result it replaced.
+- `createTask` and `getTask` returned a pointer into the task hashmap after releasing its lock, so a later insert could leave the caller with a dangling pointer and a concurrent update raced its reads. They now return owned copies.
+- A `SessionRef` released after `Server.deinit` used freed memory. `deinit` now waits for outstanding references (up to `Server.session_ref_wait_ms`, 10 s) and panics with a clear message if one is still held.
+- The HTTP acceptance tests returned early (passed) on any connection, write or read error, and read only the first chunk of each response. They now fail on errors and read the whole response, which exposed a T5 failure the early return had hidden.
 
 ### Added
 
@@ -28,6 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** `Server.createTask` returns `!Task` and `Server.getTask` returns `!?Task`, owned copies the caller frees with `task.deinit(server.allocator)`; they returned `*Task` and `?*Task`.
 - **Breaking for HTTP clients:** requests other than `initialize` without `Mcp-Session-Id` get `400` (Streamable HTTP "Session Management"). Session-scoped server messages (`emitLog`, `notifyProgress`, `notifyResourceUpdated`, `Session.notify`/`request`) sent with no session context, or over stdio with no stdout, fail with `error.NoSession` instead of being broadcast or silently dropped.
 
 ## [0.1.25] - 2026-11-15

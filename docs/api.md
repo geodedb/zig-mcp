@@ -278,7 +278,8 @@ transport with one session per client:
   Other messages need a session: from outside a request, take one with
   `const ref = server.retainCurrentSession()` while handling a request, then
   `const scope = server.enterSession(ref); defer scope.exit();` and send.
-  Release the `SessionRef` when done, and before `deinit`. Without a session
+  Release the `SessionRef` when done; `deinit` waits for outstanding
+  references (up to 10 s, then it panics). Without a session
   the call fails with `error.NoSession` and nothing is sent.
 - `DELETE` with `Mcp-Session-Id` ends the session: its `GET` stream closes
   and its pending server-to-client requests fail. Sessions with no open
