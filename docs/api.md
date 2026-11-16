@@ -186,6 +186,21 @@ it without insignificant whitespace, so a pretty-printed result cannot break
 the newline-delimited stdio transport; a result that is not one JSON value is
 answered with `-32603` and the message `Invalid handler result`.
 
+A second request that reuses the id of a request still in flight is answered
+with `-32600` ("Duplicate request id"); the first request is unaffected and
+stays cancellable. An id can be reused once its request has completed.
+
+Server-to-client requests (`requestRoots`, `requestSampling`,
+`requestSamplingFull`, `requestElicitation`, `Session.request`) need the stdio
+transport's `Session`. When the client's response arrives on the same
+transport, `processMessage` hands it to the waiting call and sends nothing
+back. The call returns the `result` as minified JSON allocated with the server
+allocator (the caller frees it), `error.ClientError` when the client answered
+with an error, or `error.Timeout`. A response to an unknown or already
+answered id is dropped. `Session.notify` and `Session.request` escape the
+method, and `params_json` must be exactly one JSON value
+(`error.InvalidParamsJson` otherwise, and nothing is sent).
+
 ### Server Methods
 
 ```zig

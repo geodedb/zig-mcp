@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.24] - 2026-11-15
+
+### Fixed
+
+- A client's response to a server-to-client request was answered with `-32600` "Missing method" and never delivered, so `requestRoots`, `requestSampling`, `requestSamplingFull` and `requestElicitation` always timed out (SONNY-6643). `processMessage` now treats a message with no `method` and a `result` or an `error` as a response (MCP 2025-11-25 basic "Responses"): it resolves the pending request and is never answered. Responses to unknown or already answered ids, with a string id, or with both or neither of `result` and `error` are dropped silently. A response that races the timeout is returned instead of leaked.
+- `Session.notify`, `Session.request` and the server's notifications (`notifyProgress`, `emitLog`, `notifyResourceUpdated`) inserted caller strings and JSON raw. The method, progress token, log level, logger, message and uri are now JSON-escaped, and `params_json` must be exactly one JSON value; it is sent minified, otherwise `error.InvalidParamsJson` is returned and nothing is sent.
+- A second request reusing the id of a request still in flight replaced the first one's registration, so the first could no longer be cancelled. Every request with an id is now tracked while it runs, and a duplicate is answered with `-32600` ("Duplicate request id") without affecting the first.
+
+### Changed
+
+- `Session.request` returns `error.ClientError` when the client answers with a JSON-RPC error, and the result JSON (minified, allocated with the server allocator, owned by the caller) on success.
+- Pre-commit hygiene in `GAPS.md`, `SECURITY.md`, `SUPPORT.md`, `docs/ARCHITECTURE.md`, `docs/ROADMAP.md` and the GitLab issue/MR templates (markdownlint, trailing whitespace, end of file): blank lines around headings and lists, `text` on bare code fences, angle-bracketed contact emails, and the `GAPS.md` phase lists numbered from 1 per phase. `pre-commit run --all-files` is now clean.
+
 ## [0.1.23] - 2026-11-15
 
 ### Fixed
@@ -168,7 +181,8 @@ Initial open source release of the MCP Server Library for Zig.
 - Gitleaks allowlist configuration for test data
 - Apache-2.0 open source licensing
 
-[Unreleased]: https://gitlab.com/devnw/zig/mcp/-/compare/v0.1.23...HEAD
+[Unreleased]: https://gitlab.com/devnw/zig/mcp/-/compare/v0.1.24...HEAD
+[0.1.24]: https://gitlab.com/devnw/zig/mcp/-/compare/v0.1.23...v0.1.24
 [0.1.23]: https://gitlab.com/devnw/zig/mcp/-/compare/v0.1.22...v0.1.23
 [0.1.22]: https://gitlab.com/devnw/zig/mcp/-/compare/v0.1.21...v0.1.22
 [0.1.21]: https://gitlab.com/devnw/zig/mcp/-/compare/v0.1.20...v0.1.21
