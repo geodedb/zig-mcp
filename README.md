@@ -16,7 +16,6 @@ A Zig 0.15.2 implementation of the [Model Context Protocol (MCP)](https://modelc
 - **Transports** - stdio (newline-delimited) and Streamable HTTP with SSE
 - **Authentication** - Bearer, Basic, and OAuth2.1 with embedded endpoints
 - **Parallel Handling** - Worker thread pool with cancellation support
-- **Deterministic Testing** - Barrier tool for proving parallelism without timing
 
 ## Protocol Version
 
@@ -170,11 +169,16 @@ value, such as `{"uri":"file:///x"}`, or `setErrorDetail` returns
 every response.
 
 The server never answers a notification (a message without an `id`), even
-when it fails. A `tools/call` request with an integer id is cancelled when
+when it fails. A `tools/call` request (string or integer id) is cancelled when
 the client sends `notifications/cancelled` for it: `cancel.isCancelled()`
 becomes true, and if the handler then returns `error.Cancelled` no response
 is sent. A request whose `id` is present but is not a string or an integer
 is answered with `-32600` (Invalid Request) and a null id.
+
+A successful result must be exactly one JSON value. The server re-serialises
+it without insignificant whitespace, so a pretty-printed result cannot break
+the newline-delimited stdio transport; a result that is not one JSON value is
+answered with `-32603` and the message `Invalid handler result`.
 
 ## Testing
 
@@ -192,7 +196,7 @@ zig build test-accept
 |------|-------------|
 | T1 | stdio init+initialized+ping => correct responses |
 | T2 | stdio batch of 2 pings => ordered batch response |
-| T3 | stdio batch of 2 barrier calls => proves parallelism |
+| T3 | stdio batch of 2 calls to a test-only barrier tool => proves parallelism |
 | T4 | HTTP bearer: 401 without auth, 200 with token + session ID |
 | T5 | HTTP oauth2: well-known endpoint returns metadata |
 
@@ -325,8 +329,8 @@ Apache-2.0 License - see [LICENSE](LICENSE) for details.
 ## Rationale
 
 - Single-file design minimizes module complexity for MCP server use case
-- Handler callbacks return JSON strings for zero-copy response embedding
-- Barrier tool uses atomics for deterministic parallelism proof without timing
+- Handler callbacks return JSON strings, which the server validates and re-serialises compactly into the response
+- The parallelism acceptance test (T3) uses a barrier tool defined in the test, not in the library
 - OAuth2.1 metadata endpoint enables client autodiscovery
 - SSE connections tracked per session for server→client messaging
 - Thread pool workers check shutdown flag at 1ms intervals for responsive stop

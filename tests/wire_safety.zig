@@ -364,3 +364,25 @@ test "handler result that is not one JSON value is an Internal error" {
         try std.testing.expectEqualStrings("-32603", field(e, "code").?.num.lexeme);
     }
 }
+
+// ----------------------------------------------------------------------------
+// Experimental client capabilities are owned and freed by the server
+// ----------------------------------------------------------------------------
+
+test "experimental capabilities from repeated initialize are not leaked" {
+    const a = std.testing.allocator;
+    var h: WireHandler = .{ .allocator = a };
+    var server = try mcp.Server.init(a, .{ .name = "t", .version = "1" }, h.handler());
+    defer server.deinit();
+
+    for ([_][]const u8{
+        \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{"experimental":{"a":1}},"clientInfo":{"name":"t","version":"1"}}}
+        ,
+        \\{"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{"experimental":{"b":2}},"clientInfo":{"name":"t","version":"1"}}}
+        ,
+    }) |msg| {
+        const resp = try server.processMessage(msg);
+        if (resp) |r| a.free(r);
+    }
+    try std.testing.expectEqualStrings("{\"b\":2}", server.client_capabilities.experimental.?);
+}

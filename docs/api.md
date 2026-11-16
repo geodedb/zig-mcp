@@ -175,11 +175,16 @@ value, such as `{"uri":"file:///x"}`, or `setErrorDetail` returns
 every response.
 
 The server never answers a notification (a message without an `id`), even
-when it fails. A `tools/call` request with an integer id is cancelled when
+when it fails. A `tools/call` request (string or integer id) is cancelled when
 the client sends `notifications/cancelled` for it: `cancel.isCancelled()`
 becomes true, and if the handler then returns `error.Cancelled` no response
 is sent. A request whose `id` is present but is not a string or an integer
 is answered with `-32600` (Invalid Request) and a null id.
+
+A successful result must be exactly one JSON value. The server re-serialises
+it without insignificant whitespace, so a pretty-printed result cannot break
+the newline-delimited stdio transport; a result that is not one JSON value is
+answered with `-32603` and the message `Invalid handler result`.
 
 ### Server Methods
 

@@ -981,8 +981,8 @@ pub const HealthCheck = struct {
 };
 
 /// Cancellation signal passed to `Handler.callTool`. The server sets it when
-/// the client sends `notifications/cancelled` for the request (integer
-/// request ids only) or when `checkRequestTimeouts` expires it. A handler
+/// the client sends `notifications/cancelled` for the request (string or
+/// integer id) or when `checkRequestTimeouts` expires it. A handler
 /// that stops early returns `error.Cancelled`; when the client cancelled the
 /// request the server then sends no response (MCP cancellation, SONNY-6585).
 pub const CancelToken = struct {
@@ -1076,7 +1076,7 @@ pub const Session = struct {
 
         // Wait for response with timeout
         const timeout_ns: u64 = @as(u64, timeout_ms) * std.time.ns_per_ms;
-        ctx.done.waitTimeout(io(), .{ .duration = std.Io.Duration.fromNanoseconds(@intCast(timeout_ns)) }) catch return error.Timeout;
+        ctx.done.waitTimeout(io(), .{ .duration = .{ .raw = std.Io.Duration.fromNanoseconds(@intCast(timeout_ns)), .clock = .awake } }) catch return error.Timeout;
 
         if (ctx.err) |e| return e;
         const response = ctx.response orelse return error.NoResponse;
@@ -1446,11 +1446,40 @@ fn clearErrorDetail() void {
     if (takeErrorDetail()) |d| d.deinit();
 }
 
+/// Appends `raw`, which must be exactly one JSON value, re-serialised
+/// without insignificant whitespace, so a pretty-printed handler result
+/// cannot put a raw newline into a newline-delimited stdio message.
+/// Returns `error.InvalidHandlerResult` when `raw` is not one JSON value.
+fn appendCompactJson(allocator: Allocator, buf: *std.ArrayListUnmanaged(u8), raw: []const u8) !void {
+    var err_info = json.ParseError.init();
+    var doc = json.parse(allocator, raw, .{
+        .max_bytes = @max(raw.len, 1),
+        .max_nodes = std.math.maxInt(u32),
+        .unique_keys = false,
+    }, &err_info) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidHandlerResult,
+    };
+    defer doc.deinit();
+    const compact = json.stringify(allocator, doc.root) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidHandlerResult,
+    };
+    defer allocator.free(compact);
+    try buf.appendSlice(allocator, compact);
+}
+
 /// Appends `s` as a JSON string literal: quotes, backslashes and control
 /// characters are escaped and invalid UTF-8 becomes U+FFFD, so the output is
 /// always valid JSON whatever bytes `s` holds.
 fn appendJsonString(allocator: Allocator, buf: *std.ArrayListUnmanaged(u8), s: []const u8) !void {
     try buf.append(allocator, '"');
+    try appendJsonStringContents(allocator, buf, s);
+    try buf.append(allocator, '"');
+}
+
+/// `appendJsonString` without the surrounding quotes.
+fn appendJsonStringContents(allocator: Allocator, buf: *std.ArrayListUnmanaged(u8), s: []const u8) !void {
     var i: usize = 0;
     while (i < s.len) {
         const c = s[i];
@@ -1478,7 +1507,6 @@ fn appendJsonString(allocator: Allocator, buf: *std.ArrayListUnmanaged(u8), s: [
         try buf.appendSlice(allocator, s[i .. i + len]);
         i += len;
     }
-    try buf.append(allocator, '"');
 }
 
 const RequestId = union(enum) {
@@ -1598,6 +1626,7 @@ pub const Server = struct {
     session: ?Session = null,
     cached_init_response: ?[]const u8 = null,
     client_capabilities: ClientCapabilities = .{},
+    /// Server-owned copy of the client's requested protocol version.
     client_protocol_version: ?[]const u8 = null,
 
     // Transport state
@@ -1618,6 +1647,9 @@ pub const Server = struct {
 
     // Cancellation and timeout tracking (GAP-024, GAP-005)
     active_requests: std.AutoHashMapUnmanaged(i64, RequestInfo) = .{},
+    /// In-flight requests with a string id. Keys borrow the id from the
+    /// parsed message, which outlives the registration.
+    active_string_requests: std.StringHashMapUnmanaged(RequestInfo) = .{},
     requests_mutex: std.Io.Mutex = std.Io.Mutex.init,
 
     // Rate limiting (GAP-029)
@@ -1660,11 +1692,6 @@ pub const Server = struct {
     // Legacy direct access (for backward compatibility in tests using unbuffered I/O)
     stdin_reader: ?std.Io.File.Reader = null,
     stdout_writer: ?std.Io.File.Writer = null,
-
-    // Barrier for testing parallelism
-    barrier_waiting: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-    barrier_target: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-    barrier_event: std.Io.Event = .unset,
 
     // Default I/O buffer size (can be configured via options.stdio_buffer_size)
     const DefaultStdioBufferSize: usize = 65536;
@@ -1764,6 +1791,7 @@ pub const Server = struct {
 
         // Clean up active requests (GAP-024)
         self.active_requests.deinit(self.allocator);
+        self.active_string_requests.deinit(self.allocator);
 
         if (self.session) |*s| {
             s.deinit();
@@ -1780,6 +1808,13 @@ pub const Server = struct {
         // Free cached init response
         if (self.cached_init_response) |cached| {
             self.allocator.free(cached);
+        }
+
+        if (self.client_protocol_version) |v| {
+            self.allocator.free(v);
+        }
+        if (self.client_capabilities.experimental) |e| {
+            self.allocator.free(e);
         }
     }
 
@@ -1974,7 +2009,7 @@ pub const Server = struct {
 
         if (req.tool_choice) |tc| {
             try buf.appendSlice(self.allocator, ",\"toolChoice\":\"");
-            try buf.appendSlice(self.allocator, tc);
+            try self.writeJsonEscapedString(&buf, tc);
             try buf.append(self.allocator, '"');
         }
 
@@ -1985,7 +2020,7 @@ pub const Server = struct {
 
         if (req.include_context) |ic| {
             try buf.appendSlice(self.allocator, ",\"includeContext\":\"");
-            try buf.appendSlice(self.allocator, ic);
+            try self.writeJsonEscapedString(&buf, ic);
             try buf.append(self.allocator, '"');
         }
 
@@ -2004,17 +2039,9 @@ pub const Server = struct {
         return error.NoSession;
     }
 
+    /// Appends `str` JSON-escaped, without quotes (see `appendJsonString`).
     fn writeJsonEscapedString(self: *Server, out: *std.ArrayListUnmanaged(u8), str: []const u8) !void {
-        for (str) |c| {
-            switch (c) {
-                '"' => try out.appendSlice(self.allocator, "\\\""),
-                '\\' => try out.appendSlice(self.allocator, "\\\\"),
-                '\n' => try out.appendSlice(self.allocator, "\\n"),
-                '\r' => try out.appendSlice(self.allocator, "\\r"),
-                '\t' => try out.appendSlice(self.allocator, "\\t"),
-                else => try out.append(self.allocator, c),
-            }
-        }
+        try appendJsonStringContents(self.allocator, out, str);
     }
 
     /// Request filesystem roots from client (GAP-015)
@@ -2057,17 +2084,7 @@ pub const Server = struct {
         try buf.appendSlice(self.allocator, "{\"mode\":\"");
         try buf.appendSlice(self.allocator, @tagName(mode));
         try buf.appendSlice(self.allocator, "\",\"message\":\"");
-        // Escape message for JSON
-        for (message) |c| {
-            switch (c) {
-                '"' => try buf.appendSlice(self.allocator, "\\\""),
-                '\\' => try buf.appendSlice(self.allocator, "\\\\"),
-                '\n' => try buf.appendSlice(self.allocator, "\\n"),
-                '\r' => try buf.appendSlice(self.allocator, "\\r"),
-                '\t' => try buf.appendSlice(self.allocator, "\\t"),
-                else => try buf.append(self.allocator, c),
-            }
-        }
+        try self.writeJsonEscapedString(&buf, message);
         try buf.appendSlice(self.allocator, "\"");
 
         switch (mode) {
@@ -2076,9 +2093,8 @@ pub const Server = struct {
                 try buf.appendSlice(self.allocator, schema_or_url);
             },
             .url => {
-                try buf.appendSlice(self.allocator, ",\"url\":\"");
-                try buf.appendSlice(self.allocator, schema_or_url);
-                try buf.appendSlice(self.allocator, "\"");
+                try buf.appendSlice(self.allocator, ",\"url\":");
+                try appendJsonString(self.allocator, &buf, schema_or_url);
             },
         }
         try buf.append(self.allocator, '}');
@@ -2769,31 +2785,41 @@ pub const Server = struct {
         return true;
     }
 
-    /// Cancel a request by ID (GAP-024)
-    fn cancelRequest(self: *Server, request_id: i64) void {
+    /// Cancel a request by ID (GAP-024). String and integer ids are
+    /// distinct: "7" does not match 7.
+    fn cancelRequest(self: *Server, request_id: RequestId) void {
         self.requests_mutex.lockUncancelable(io());
         defer self.requests_mutex.unlock(io());
 
-        if (self.active_requests.get(request_id)) |info| {
-            info.token.cancelByPeer();
-        }
+        const info = switch (request_id) {
+            .int => |i| self.active_requests.get(i),
+            .str => |str| self.active_string_requests.get(str),
+        };
+        if (info) |i| i.token.cancelByPeer();
     }
 
     /// Register a request for cancellation/timeout tracking (GAP-024, GAP-005)
-    fn registerRequest(self: *Server, request_id: i64, token: *CancelToken) void {
+    fn registerRequest(self: *Server, request_id: RequestId, token: *CancelToken) void {
         self.requests_mutex.lockUncancelable(io());
         defer self.requests_mutex.unlock(io());
-        self.active_requests.put(self.allocator, request_id, .{
+        const info: RequestInfo = .{
             .token = token,
             .start_time = std.Io.Timestamp.now(io(), .real).toMilliseconds(),
-        }) catch {};
+        };
+        switch (request_id) {
+            .int => |i| self.active_requests.put(self.allocator, i, info) catch {},
+            .str => |str| self.active_string_requests.put(self.allocator, str, info) catch {},
+        }
     }
 
     /// Unregister a request after completion (GAP-024)
-    fn unregisterRequest(self: *Server, request_id: i64) void {
+    fn unregisterRequest(self: *Server, request_id: RequestId) void {
         self.requests_mutex.lockUncancelable(io());
         defer self.requests_mutex.unlock(io());
-        _ = self.active_requests.remove(request_id);
+        switch (request_id) {
+            .int => |i| _ = self.active_requests.remove(i),
+            .str => |str| _ = self.active_string_requests.remove(str),
+        }
     }
 
     /// Check and timeout stale requests (GAP-005)
@@ -2808,6 +2834,12 @@ pub const Server = struct {
 
         var iter = self.active_requests.iterator();
         while (iter.next()) |entry| {
+            if (now - entry.value_ptr.start_time > timeout_ms) {
+                entry.value_ptr.token.cancel();
+            }
+        }
+        var str_iter = self.active_string_requests.iterator();
+        while (str_iter.next()) |entry| {
             if (now - entry.value_ptr.start_time > timeout_ms) {
                 entry.value_ptr.token.cancel();
             }
@@ -3071,13 +3103,10 @@ pub const Server = struct {
         defer __obs_span.end(null);
         errdefer observability.endRpcServerSpan(__obs_span, false, JsonRpcError.InternalError);
 
-        // GAP-024: make a tools/call request with an integer id cancellable
-        // by the client's notifications/cancelled while it runs.
+        // GAP-024: make a tools/call request cancellable by the client's
+        // notifications/cancelled while it runs.
         var cancel = CancelToken{};
-        const cancel_id: ?i64 = if (id) |req_id| switch (req_id) {
-            .int => |i| if (std.mem.eql(u8, method.?, "tools/call")) i else null,
-            .str => null,
-        } else null;
+        const cancel_id: ?RequestId = if (id != null and std.mem.eql(u8, method.?, "tools/call")) id else null;
         if (cancel_id) |cid| self.registerRequest(cid, &cancel);
         defer if (cancel_id) |cid| self.unregisterRequest(cid);
 
@@ -3129,8 +3158,16 @@ pub const Server = struct {
             return null;
         }
 
-        // Build success response
-        const response = try self.makeSuccessResponse(id.?, method_result.result);
+        // Build success response. A handler result that is not one JSON
+        // value is a handler bug: answer with an Internal error rather than
+        // send a malformed response.
+        const response = self.makeSuccessResponse(id.?, method_result.result) catch |err| switch (err) {
+            error.InvalidHandlerResult => {
+                observability.endRpcServerSpan(__obs_span, false, JsonRpcError.InternalError);
+                return @as(?[]const u8, try self.makeErrorResponse(id, JsonRpcError.InternalError, "Invalid handler result"));
+            },
+            else => |e| return e,
+        };
 
         observability.endRpcServerSpan(__obs_span, true, 0);
         return @as(?[]const u8, response);
@@ -3168,11 +3205,6 @@ pub const Server = struct {
             return .{ .result = try self.handler.listTools(self.handler.ctx, cursor), .owned = true };
         } else if (std.mem.eql(u8, method, "tools/call")) {
             const name = self.extractString(params, "name") orelse return error.InvalidParams;
-
-            // Check for barrier tool (testing parallelism) - handle before args parsing
-            if (std.mem.eql(u8, name, "barrier")) {
-                return .{ .result = try self.handleBarrierTool(params), .owned = false }; // static string
-            }
 
             const args = self.extractObject(params, "arguments");
             var args_json: []const u8 = "{}";
@@ -3231,9 +3263,14 @@ pub const Server = struct {
                 if (p == .obj) {
                     for (p.obj) |member| {
                         if (std.mem.eql(u8, member.k, "requestId")) {
-                            if (member.v == .num) {
-                                const req_id = std.fmt.parseInt(i64, member.v.num.lexeme, 10) catch 0;
-                                self.cancelRequest(req_id);
+                            // MCP RequestId is a string or an integer; an
+                            // invalid one is ignored (cancellation spec).
+                            switch (member.v) {
+                                .num => |n| if (std.fmt.parseInt(i64, n.lexeme, 10)) |req_id| {
+                                    self.cancelRequest(.{ .int = req_id });
+                                } else |_| {},
+                                .str => |str| self.cancelRequest(.{ .str = str }),
+                                else => {},
                             }
                         }
                     }
@@ -3278,8 +3315,12 @@ pub const Server = struct {
                 for (p.obj) |member| {
                     if (std.mem.eql(u8, member.k, "protocolVersion")) {
                         if (member.v == .str) {
-                            // Store client's requested version
-                            self.client_protocol_version = member.v.str;
+                            // Store a copy of the client's requested version:
+                            // member.v.str points into the parsed message,
+                            // which is freed when this request completes.
+                            const version = try self.allocator.dupe(u8, member.v.str);
+                            if (self.client_protocol_version) |old| self.allocator.free(old);
+                            self.client_protocol_version = version;
                         }
                     } else if (std.mem.eql(u8, member.k, "capabilities")) {
                         if (member.v == .obj) {
@@ -3321,7 +3362,9 @@ pub const Server = struct {
                                 } else if (std.mem.eql(u8, cap.k, "experimental")) {
                                     // GAP-026: Store experimental capabilities as raw JSON
                                     if (cap.v == .obj) {
-                                        self.client_capabilities.experimental = json.stringify(self.allocator, cap.v) catch null;
+                                        const experimental = json.stringify(self.allocator, cap.v) catch null;
+                                        if (self.client_capabilities.experimental) |old| self.allocator.free(old);
+                                        self.client_capabilities.experimental = experimental;
                                     }
                                 }
                             }
@@ -3581,48 +3624,6 @@ pub const Server = struct {
         }
     }
 
-    fn handleBarrierTool(self: *Server, params: ?json.Value) ![]const u8 {
-        // Extract target count from params
-        var target: u32 = 2;
-        if (params) |p| {
-            if (p == .obj) {
-                for (p.obj) |member| {
-                    if (std.mem.eql(u8, member.k, "arguments")) {
-                        if (member.v == .obj) {
-                            for (member.v.obj) |arg| {
-                                if (std.mem.eql(u8, arg.k, "count")) {
-                                    if (arg.v == .num) {
-                                        target = @intCast(std.fmt.parseInt(u32, arg.v.num.lexeme, 10) catch 2);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Set target and increment waiting count
-        _ = self.barrier_target.cmpxchgStrong(0, target, .monotonic, .monotonic);
-        const current = self.barrier_waiting.fetchAdd(1, .acq_rel) + 1;
-
-        // If we've reached the target, signal all waiters
-        if (current >= self.barrier_target.load(.acquire)) {
-            self.barrier_event.set(io());
-        } else {
-            // Wait for other requests
-            self.barrier_event.waitUncancelable(io());
-        }
-
-        // Reset for next use
-        if (self.barrier_waiting.fetchSub(1, .acq_rel) == 1) {
-            self.barrier_target.store(0, .release);
-            self.barrier_event.reset();
-        }
-
-        return "{\"content\":[{\"type\":\"text\",\"text\":\"barrier passed\"}]}";
-    }
-
     fn extractCursor(self: *Server, params: ?json.Value) ?[]const u8 {
         _ = self;
         if (params) |p| {
@@ -3681,11 +3682,14 @@ pub const Server = struct {
             .str => |s| try appendJsonString(self.allocator, &buf, s),
         }
         try buf.appendSlice(self.allocator, ",\"result\":");
-        try buf.appendSlice(self.allocator, result orelse "null");
+        if (result) |r| {
+            try appendCompactJson(self.allocator, &buf, r);
+        } else {
+            try buf.appendSlice(self.allocator, "null");
+        }
         try buf.append(self.allocator, '}');
 
-        // Note: result is NOT freed here - handlers may return static strings
-        // or allocated memory. Caller is responsible for their own allocations.
+        // Note: result is NOT freed here; processJsonValue owns it.
         return buf.toOwnedSlice(self.allocator);
     }
 
@@ -3813,14 +3817,14 @@ pub const DemoHandler = struct {
 
     fn listTools(ctx: ?*anyopaque, _: ?[]const u8) anyerror![]const u8 {
         return owned(ctx,
-            \\{"tools":[{"name":"barrier","description":"Barrier for testing parallelism","inputSchema":{"type":"object","properties":{"count":{"type":"integer"}}}}]}
+            \\{"tools":[{"name":"echo","description":"Replies with a fixed text","inputSchema":{"type":"object"}}]}
         );
     }
 
     fn callTool(ctx: ?*anyopaque, name: []const u8, _: []const u8, _: *const CancelToken) anyerror![]const u8 {
-        if (std.mem.eql(u8, name, "barrier")) {
+        if (std.mem.eql(u8, name, "echo")) {
             return owned(ctx,
-                \\{"content":[{"type":"text","text":"barrier passed"}]}
+                \\{"content":[{"type":"text","text":"echo"}]}
             );
         }
         return error.ToolNotFound;
