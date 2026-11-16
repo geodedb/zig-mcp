@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - `Session.request` returns `error.ClientError` when the client answers with a JSON-RPC error, and the result JSON (minified, allocated with the server allocator, owned by the caller) on success.
+- Pre-commit hygiene in `GAPS.md`, `SECURITY.md`, `SUPPORT.md`, `docs/ARCHITECTURE.md`, `docs/ROADMAP.md` and the GitLab issue/MR templates (markdownlint, trailing whitespace, end of file): blank lines around headings and lists, `text` on bare code fences, angle-bracketed contact emails, and the `GAPS.md` phase lists numbered from 1 per phase. `pre-commit run --all-files` is now clean.
 
 ## [0.1.23] - 2026-11-15
 
