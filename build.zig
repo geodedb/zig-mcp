@@ -419,6 +419,26 @@ pub fn build(b: *std.Build) void {
     const run_ownership_test = b.addRunArtifact(ownership_test);
     test_step.dependOn(&run_ownership_test.step);
 
+    // JSON-RPC error semantics tests (SONNY-6585)
+    const test_errors_step = b.step("test-errors", "Run JSON-RPC error semantics tests only");
+    for ([_][]const u8{ "tests/jsonrpc_errors.zig", "tests/error_detail.zig" }) |path| {
+        const errors_test_mod = b.createModule(.{
+            .root_source_file = b.path(path),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "mcp", .module = mcp_mod },
+            },
+        });
+        if (json_mod) |m| errors_test_mod.addImport("json", m);
+        const errors_test = b.addTest(.{
+            .root_module = errors_test_mod,
+        });
+        const run_errors_test = b.addRunArtifact(errors_test);
+        test_step.dependOn(&run_errors_test.step);
+        test_errors_step.dependOn(&run_errors_test.step);
+    }
+
     // Separate test steps
     const test_accept_step = b.step("test-accept", "Run acceptance tests only");
     test_accept_step.dependOn(&run_accept_test.step);
