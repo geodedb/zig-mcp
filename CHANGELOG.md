@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `error.ToolNotFound` and `error.PromptNotFound` are now answered with `-32602` (Invalid params), as MCP 2025-11-25 server/tools and server/prompts specify; they were `-32002`, the resource-not-found code (SONNY-6585). `error.ResourceNotFound` stays `-32002`.
+- The server no longer answers a notification that fails (JSON-RPC 2.0 section 4.1), including inside a batch and before `initialize`. It used to send an error response with a null id.
+- `notifications/cancelled` now reaches the running `tools/call` handler: the `CancelToken` passed to `callTool` is registered under the request's integer id, so `cancel.isCancelled()` becomes true. If the handler then returns `error.Cancelled`, no response is sent (MCP cancellation). A handler that returns `error.Cancelled` for any other reason still gets an error response.
+- The error `message` and a string `id` are JSON-escaped in error and success responses. A quote, backslash or control character in either produced invalid JSON; invalid UTF-8 is replaced with U+FFFD.
+- A request whose `id` is present but is not a string or an integer (`null`, a boolean, an object, `1.5`) is answered with `-32600` (Invalid Request) and a null id. It was handled as a notification, and an unparseable number became id `0`.
+
+### Added
+
+- `setErrorDetail(allocator, message, data_json)`: a handler sets the JSON-RPC error `message` and `data` for the error it returns, for example `"Unknown tool: X"` or `{"uri": ...}`. The server frees the detail. `data_json` must be one JSON value, otherwise `error.InvalidErrorData`.
+- `CancelToken.isCancelledByPeer()`: true when the client cancelled the request, as opposed to a server-side timeout.
+
 ## [0.1.22] - 2026-11-14
 
 ### Fixed

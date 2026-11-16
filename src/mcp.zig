@@ -980,15 +980,32 @@ pub const HealthCheck = struct {
     }
 };
 
+/// Cancellation signal passed to `Handler.callTool`. The server sets it when
+/// the client sends `notifications/cancelled` for the request (integer
+/// request ids only) or when `checkRequestTimeouts` expires it. A handler
+/// that stops early returns `error.Cancelled`; when the client cancelled the
+/// request the server then sends no response (MCP cancellation, SONNY-6585).
 pub const CancelToken = struct {
     cancelled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    by_peer: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     pub fn isCancelled(self: *const CancelToken) bool {
         return self.cancelled.load(.acquire);
     }
 
+    /// True when the cancellation came from the client's
+    /// `notifications/cancelled`, not from a server-side timeout.
+    pub fn isCancelledByPeer(self: *const CancelToken) bool {
+        return self.by_peer.load(.acquire);
+    }
+
     pub fn cancel(self: *CancelToken) void {
         self.cancelled.store(true, .release);
+    }
+
+    fn cancelByPeer(self: *CancelToken) void {
+        self.by_peer.store(true, .release);
+        self.cancel();
     }
 };
 
@@ -1354,12 +1371,115 @@ const JsonRpcError = struct {
     const InvalidParams: i32 = -32602;
     const InternalError: i32 = -32603;
 
-    // MCP-specific error codes (GAP-031)
+    // MCP-specific error codes (GAP-031). MCP 2025-11-25 server/resources:
+    // resource not found is -32002. server/tools and server/prompts: an
+    // unknown tool and an invalid prompt name are -32602 (SONNY-6585).
     const ResourceNotFound: i32 = -32002;
-    const ToolNotFound: i32 = -32002;
-    const PromptNotFound: i32 = -32002;
+    const ToolNotFound: i32 = InvalidParams;
+    const PromptNotFound: i32 = InvalidParams;
     const NotInitialized: i32 = -32003;
 };
+
+// ============================================================================
+// Handler-supplied error detail (SONNY-6585)
+// ============================================================================
+
+const ErrorDetail = struct {
+    allocator: Allocator,
+    message: []u8,
+    data_json: ?[]u8,
+
+    fn deinit(self: ErrorDetail) void {
+        self.allocator.free(self.message);
+        if (self.data_json) |d| self.allocator.free(d);
+    }
+};
+
+/// Detail set by the handler running on this thread. The server dispatches
+/// each message, and calls its handler, on a single thread, so a handler's
+/// detail is never seen by another request.
+threadlocal var error_detail: ?ErrorDetail = null;
+
+/// Sets the JSON-RPC error `message` and optional `data` for the error the
+/// calling handler is about to return. Call it from inside a `Handler`
+/// callback, then return the error; the error code still comes from the
+/// error (`error.ToolNotFound` -> -32602, `error.ResourceNotFound` -> -32002,
+/// ...). Without a detail the message is the error name.
+///
+/// `message` and `data_json` are copied with `allocator`, which the server
+/// uses to free them once the response is built, when the request was a
+/// notification, or when the handler succeeds after all. A later call
+/// replaces an earlier one. `data_json` must be exactly one JSON value (for
+/// example `{"uri":"file:///x"}`); it is sent minified. Anything else
+/// returns `error.InvalidErrorData` and stores nothing.
+pub fn setErrorDetail(
+    allocator: Allocator,
+    message: []const u8,
+    data_json: ?[]const u8,
+) error{ InvalidErrorData, OutOfMemory }!void {
+    const data: ?[]u8 = if (data_json) |raw| blk: {
+        var err_info = json.ParseError.init();
+        var doc = json.parse(allocator, raw, .{}, &err_info) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidErrorData,
+        };
+        defer doc.deinit();
+        break :blk json.stringify(allocator, doc.root) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidErrorData,
+        };
+    } else null;
+    errdefer if (data) |d| allocator.free(d);
+
+    const owned_message = try allocator.dupe(u8, message);
+    clearErrorDetail();
+    error_detail = .{ .allocator = allocator, .message = owned_message, .data_json = data };
+}
+
+fn takeErrorDetail() ?ErrorDetail {
+    const detail = error_detail;
+    error_detail = null;
+    return detail;
+}
+
+fn clearErrorDetail() void {
+    if (takeErrorDetail()) |d| d.deinit();
+}
+
+/// Appends `s` as a JSON string literal: quotes, backslashes and control
+/// characters are escaped and invalid UTF-8 becomes U+FFFD, so the output is
+/// always valid JSON whatever bytes `s` holds.
+fn appendJsonString(allocator: Allocator, buf: *std.ArrayListUnmanaged(u8), s: []const u8) !void {
+    try buf.append(allocator, '"');
+    var i: usize = 0;
+    while (i < s.len) {
+        const c = s[i];
+        if (c < 0x80) {
+            switch (c) {
+                '"' => try buf.appendSlice(allocator, "\\\""),
+                '\\' => try buf.appendSlice(allocator, "\\\\"),
+                '\n' => try buf.appendSlice(allocator, "\\n"),
+                '\r' => try buf.appendSlice(allocator, "\\r"),
+                '\t' => try buf.appendSlice(allocator, "\\t"),
+                0x08 => try buf.appendSlice(allocator, "\\b"),
+                0x0c => try buf.appendSlice(allocator, "\\f"),
+                0x00...0x07, 0x0b, 0x0e...0x1f => try buf.print(allocator, "\\u{x:0>4}", .{c}),
+                else => try buf.append(allocator, c),
+            }
+            i += 1;
+            continue;
+        }
+        const len = std.unicode.utf8ByteSequenceLength(c) catch 0;
+        if (len == 0 or i + len > s.len or !std.unicode.utf8ValidateSlice(s[i .. i + len])) {
+            try buf.appendSlice(allocator, "\\ufffd");
+            i += 1;
+            continue;
+        }
+        try buf.appendSlice(allocator, s[i .. i + len]);
+        i += len;
+    }
+    try buf.append(allocator, '"');
+}
 
 const RequestId = union(enum) {
     int: i64,
@@ -2655,7 +2775,7 @@ pub const Server = struct {
         defer self.requests_mutex.unlock(io());
 
         if (self.active_requests.get(request_id)) |info| {
-            info.token.cancel();
+            info.token.cancelByPeer();
         }
     }
 
@@ -2905,6 +3025,7 @@ pub const Server = struct {
 
         // Extract fields
         var id: ?RequestId = null;
+        var id_invalid = false;
         var method: ?[]const u8 = null;
         var params: ?json.Value = null;
         var has_jsonrpc = false;
@@ -2915,11 +3036,15 @@ pub const Server = struct {
                     has_jsonrpc = true;
                 }
             } else if (std.mem.eql(u8, member.k, "id")) {
+                // MCP basic "Requests": the id MUST be a string or integer
+                // and MUST NOT be null. A present id of any other kind is an
+                // Invalid Request, not a notification (SONNY-6585).
                 id = switch (member.v) {
-                    .num => |n| .{ .int = std.fmt.parseInt(i64, n.lexeme, 10) catch 0 },
+                    .num => |n| if (std.fmt.parseInt(i64, n.lexeme, 10)) |v| .{ .int = v } else |_| null,
                     .str => |s| .{ .str = s },
                     else => null,
                 };
+                id_invalid = id == null;
             } else if (std.mem.eql(u8, member.k, "method")) {
                 if (member.v == .str) {
                     method = member.v.str;
@@ -2929,7 +3054,7 @@ pub const Server = struct {
             }
         }
 
-        if (!has_jsonrpc) {
+        if (!has_jsonrpc or id_invalid) {
             return @as(?[]const u8, try self.makeErrorResponse(id, JsonRpcError.InvalidRequest, "Invalid Request"));
         }
 
@@ -2946,8 +3071,25 @@ pub const Server = struct {
         defer __obs_span.end(null);
         errdefer observability.endRpcServerSpan(__obs_span, false, JsonRpcError.InternalError);
 
+        // GAP-024: make a tools/call request with an integer id cancellable
+        // by the client's notifications/cancelled while it runs.
+        var cancel = CancelToken{};
+        const cancel_id: ?i64 = if (id) |req_id| switch (req_id) {
+            .int => |i| if (std.mem.eql(u8, method.?, "tools/call")) i else null,
+            .str => null,
+        } else null;
+        if (cancel_id) |cid| self.registerRequest(cid, &cancel);
+        defer if (cancel_id) |cid| self.unregisterRequest(cid);
+
+        // A detail left on this thread outside a dispatch must not be
+        // attached to this request's error (SONNY-6585).
+        clearErrorDetail();
+
         // Handle the method
-        const method_result = self.handleMethod(method.?, params) catch |err| {
+        const method_result = self.handleMethod(method.?, params, &cancel) catch |err| {
+            const detail = takeErrorDetail();
+            defer if (detail) |d| d.deinit();
+
             // GAP-031: Use specific error codes based on error type
             const error_code = switch (err) {
                 error.ResourceNotFound => JsonRpcError.ResourceNotFound,
@@ -2959,8 +3101,20 @@ pub const Server = struct {
                 else => JsonRpcError.InternalError,
             };
             observability.endRpcServerSpan(__obs_span, false, error_code);
-            return @as(?[]const u8, try self.makeErrorResponse(id, error_code, @errorName(err)));
+
+            // JSON-RPC 2.0 section 4.1: the server MUST NOT reply to a
+            // notification, even when it fails.
+            if (id == null) return null;
+            // MCP cancellation: no response for a request the client
+            // cancelled with notifications/cancelled.
+            if (err == error.Cancelled and cancel.isCancelledByPeer()) return null;
+
+            const message = if (detail) |d| d.message else @errorName(err);
+            const data = if (detail) |d| d.data_json else null;
+            return @as(?[]const u8, try self.makeErrorResponseWithData(id, error_code, message, data));
         };
+        // The handler may have set a detail and then succeeded.
+        clearErrorDetail();
 
         // Free the intermediate result if it was dynamically allocated: after
         // the response is built, for a notification (no response), and when
@@ -2988,7 +3142,7 @@ pub const Server = struct {
         owned: bool, // If true, result must be freed by caller
     };
 
-    fn handleMethod(self: *Server, method: []const u8, params: ?json.Value) !MethodResult {
+    fn handleMethod(self: *Server, method: []const u8, params: ?json.Value, cancel: *CancelToken) !MethodResult {
         if (std.mem.eql(u8, method, "initialize")) {
             return .{ .result = try self.handleInitialize(params), .owned = false }; // cached
         } else if (std.mem.eql(u8, method, "ping")) {
@@ -3029,11 +3183,9 @@ pub const Server = struct {
             }
             defer if (args_allocated) self.allocator.free(args_json);
 
-            var cancel = CancelToken{};
-
             // Handler results are server-owned (see Handler "Result Ownership");
             // processJsonValue frees this slice once the response is built.
-            return .{ .result = try self.handler.callTool(self.handler.ctx, name, args_json, &cancel), .owned = true };
+            return .{ .result = try self.handler.callTool(self.handler.ctx, name, args_json, cancel), .owned = true };
         } else if (std.mem.eql(u8, method, "resources/list")) {
             const cursor = self.extractCursor(params);
             return .{ .result = try self.handler.listResources(self.handler.ctx, cursor), .owned = true };
@@ -3526,11 +3678,7 @@ pub const Server = struct {
         try buf.appendSlice(self.allocator, "{\"jsonrpc\":\"2.0\",\"id\":");
         switch (id) {
             .int => |i| try buf.print(self.allocator, "{d}", .{i}),
-            .str => |s| {
-                try buf.append(self.allocator, '"');
-                try buf.appendSlice(self.allocator, s);
-                try buf.append(self.allocator, '"');
-            },
+            .str => |s| try appendJsonString(self.allocator, &buf, s),
         }
         try buf.appendSlice(self.allocator, ",\"result\":");
         try buf.appendSlice(self.allocator, result orelse "null");
@@ -3545,7 +3693,8 @@ pub const Server = struct {
         return self.makeErrorResponseWithData(id, code, message, null);
     }
 
-    /// GAP-032: Error response with optional data field
+    /// GAP-032: Error response with optional data field. `message` and a
+    /// string id are JSON-escaped; `data` must already be one JSON value.
     fn makeErrorResponseWithData(self: *Server, id: ?RequestId, code: i32, message: []const u8, data: ?[]const u8) ![]const u8 {
         var buf = std.ArrayListUnmanaged(u8).empty;
         errdefer buf.deinit(self.allocator);
@@ -3554,20 +3703,15 @@ pub const Server = struct {
         if (id) |req_id| {
             switch (req_id) {
                 .int => |i| try buf.print(self.allocator, "{d}", .{i}),
-                .str => |s| {
-                    try buf.append(self.allocator, '"');
-                    try buf.appendSlice(self.allocator, s);
-                    try buf.append(self.allocator, '"');
-                },
+                .str => |s| try appendJsonString(self.allocator, &buf, s),
             }
         } else {
             try buf.appendSlice(self.allocator, "null");
         }
         try buf.appendSlice(self.allocator, ",\"error\":{\"code\":");
         try buf.print(self.allocator, "{d}", .{code});
-        try buf.appendSlice(self.allocator, ",\"message\":\"");
-        try buf.appendSlice(self.allocator, message);
-        try buf.append(self.allocator, '"');
+        try buf.appendSlice(self.allocator, ",\"message\":");
+        try appendJsonString(self.allocator, &buf, message);
         if (data) |d| {
             try buf.appendSlice(self.allocator, ",\"data\":");
             try buf.appendSlice(self.allocator, d);
