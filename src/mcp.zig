@@ -1212,6 +1212,29 @@ pub const Task = struct {
     /// null for stdio. Only that client can see it (SONNY-6644).
     owner: ?[]const u8 = null,
 
+    /// Frees a task returned by `Server.createTask` or `Server.getTask`
+    /// (pass the server's allocator).
+    pub fn deinit(self: *Task, allocator: Allocator) void {
+        if (self.result) |r| allocator.free(r);
+        if (self.owner) |o| allocator.free(o);
+        allocator.free(self.method);
+        allocator.free(self.id);
+        self.* = undefined;
+    }
+
+    /// An owned deep copy (strings duplicated with `allocator`).
+    fn clone(self: *const Task, allocator: Allocator) !Task {
+        var copy = self.*;
+        copy.id = try allocator.dupe(u8, self.id);
+        errdefer allocator.free(copy.id);
+        copy.method = try allocator.dupe(u8, self.method);
+        errdefer allocator.free(copy.method);
+        copy.result = if (self.result) |r| try allocator.dupe(u8, r) else null;
+        errdefer if (copy.result) |r| allocator.free(r);
+        copy.owner = if (self.owner) |o| try allocator.dupe(u8, o) else null;
+        return copy;
+    }
+
     pub fn toJson(self: *const Task, allocator: Allocator) ![]const u8 {
         var buf = std.ArrayListUnmanaged(u8).empty;
         try buf.print(allocator,
@@ -4017,9 +4040,20 @@ pub const Server = struct {
     }
 
     /// Create a new task for async request processing (GAP-040)
-    pub fn createTask(self: *Server, method: []const u8, ttl_ms: ?u32) !*Task {
+    ///
+    /// Returns an owned copy of the new task; free it with
+    /// `task.deinit(server.allocator)`. It is a snapshot: use `getTask`
+    /// for the current state. (It returned a pointer into the task table,
+    /// which a later insert could move: SONNY-6644.)
+    pub fn createTask(self: *Server, method: []const u8, ttl_ms: ?u32) !Task {
         const task_id = try self.generateTaskId();
+        errdefer self.allocator.free(task_id);
         const now = std.Io.Timestamp.now(io(), .real).toMilliseconds();
+
+        const owned_method = try self.allocator.dupe(u8, method);
+        errdefer self.allocator.free(owned_method);
+        const owner = if (dispatch_ctx.http) |hs| try self.allocator.dupe(u8, hs.id) else null;
+        errdefer if (owner) |o| self.allocator.free(o);
 
         const task = Task{
             .id = task_id,
@@ -4029,15 +4063,20 @@ pub const Server = struct {
             .ttl_ms = ttl_ms orelse self.options.tasks_default_ttl_ms,
             .poll_interval_ms = self.options.tasks_poll_interval_ms,
             .result = null,
-            .method = try self.allocator.dupe(u8, method),
-            .owner = if (dispatch_ctx.http) |hs| try self.allocator.dupe(u8, hs.id) else null,
+            .method = owned_method,
+            .owner = owner,
         };
 
         self.tasks_mutex.lockUncancelable(io());
         defer self.tasks_mutex.unlock(io());
 
+        const copy = try task.clone(self.allocator);
+        errdefer {
+            var c = copy;
+            c.deinit(self.allocator);
+        }
         try self.tasks.put(self.allocator, task_id, task);
-        return self.tasks.getPtr(task_id).?;
+        return copy;
     }
 
     /// Whether the client being served may see `task`: tasks belong to the
@@ -4058,17 +4097,17 @@ pub const Server = struct {
     }
 
     fn freeTask(self: *Server, task: *Task) void {
-        if (task.result) |r| self.allocator.free(r);
-        if (task.owner) |o| self.allocator.free(o);
-        self.allocator.free(task.method);
-        self.allocator.free(task.id);
+        task.deinit(self.allocator);
     }
 
-    /// Get task by ID
-    pub fn getTask(self: *Server, task_id: []const u8) ?*Task {
+    /// An owned copy of the task with `task_id` (current state), or null;
+    /// free it with `task.deinit(server.allocator)`. (It returned a pointer
+    /// into the task table after releasing its lock: SONNY-6644.)
+    pub fn getTask(self: *Server, task_id: []const u8) !?Task {
         self.tasks_mutex.lockUncancelable(io());
         defer self.tasks_mutex.unlock(io());
-        return self.tasks.getPtr(task_id);
+        const task = self.tasks.getPtr(task_id) orelse return null;
+        return try task.clone(self.allocator);
     }
 
     /// Update task status
