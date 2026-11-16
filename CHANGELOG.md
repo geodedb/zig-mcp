@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Duplicate request ids inside one batch were rejected depending on timing: on the worker pool either item could win, and sequentially both ran (SONNY-6644). The batch is now scanned in order before dispatch: the first request with an id runs, and every later request reusing it is answered with `-32600` ("Duplicate request id") and never dispatched. Integer and string ids are distinct; notifications and client responses are not counted.
+- An allocation failure part-way through a sequential batch leaked the responses already built.
+
 ## [0.1.24] - 2026-11-15
 
 ### Fixed
