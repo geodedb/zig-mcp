@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **The HTTP transport sent every server message to every SSE stream**, so one client could receive another client's notifications, log messages and server-to-client requests (SONNY-6644). Each Streamable HTTP client now has its own session, and messages go only to that client. `Last-Event-ID` replay drew on a buffer shared by all clients and now replays only the session's own events. Tasks were readable, listable and cancellable by any client and now belong to the session that created them (`Task.owner`).
+
+### Fixed
+
+- Streamable HTTP sessions (MCP 2025-11-25 basic/transports). `initialize` without `Mcp-Session-Id` creates a session with a stable random id; previously every response minted a new one. Requests other than `initialize` need the id (`400` without, `404` for an unknown, deleted or expired session). Initialization state, capabilities, request ids, cancellations and server-to-client requests are per session, so clients no longer collide on request ids or cancel each other's requests.
+- Server-to-client requests (`requestRoots`, `requestSampling`, `requestElicitation`) work over HTTP. They returned `error.NoSession` because only stdio created a `Session`. Messages sent while handling a POST go on that POST's SSE stream before the response; others go on the session's `GET` stream.
+- The `GET` SSE stream was closed as soon as it was registered, so later writes went to a closed and possibly reused descriptor. It now stays open until the client disconnects, the session ends or the server stops, and a new `GET` replaces the old stream.
+- HTTP connections were handled one at a time on the accept thread, so a request waiting for its client blocked everyone. Each connection now runs on its own thread (`http_max_connections`, default 64, then `503`), and `stop()` wakes and waits for them.
+- The request body was a single 8 KiB read with `Content-Length` ignored. The server now reads the full declared body, up to `max_message_bytes` (`413`) with headers up to 16 KiB (`431`), within `http_request_timeout_ms` (default 30 s, `408`).
+- `DELETE` closes the session's stream and fails its pending server-to-client requests. Sessions idle for `http_session_idle_timeout_ms` (default 30 minutes) with no open connection expire.
+- Tasks were never freed, and `updateTaskStatus` leaked the result it replaced.
+
+### Added
+
+- `Server.retainCurrentSession() ?SessionRef`, `SessionRef.id()`/`release()`, and `Server.enterSession(ref) SessionScope` (`scope.exit()`), to reach a client later from any thread.
+- `ServerOptions.http_session_idle_timeout_ms`, `http_max_connections`, `http_request_timeout_ms`.
+
+### Changed
+
+- **Breaking for HTTP clients:** requests other than `initialize` without `Mcp-Session-Id` get `400` (Streamable HTTP "Session Management"). Session-scoped server messages (`emitLog`, `notifyProgress`, `notifyResourceUpdated`, `Session.notify`/`request`) sent with no session context, or over stdio with no stdout, fail with `error.NoSession` instead of being broadcast or silently dropped.
+
 ## [0.1.25] - 2026-11-15
 
 ### Fixed
