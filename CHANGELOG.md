@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.25] - 2026-11-15
+
 ### Fixed
 
 - Duplicate request ids inside one batch were rejected depending on timing: on the worker pool either item could win, and sequentially both ran (SONNY-6644). The batch is now scanned in order before dispatch: the first request with an id runs, and every later request reusing it is answered with `-32600` ("Duplicate request id") and never dispatched. Integer and string ids are distinct; notifications and client responses are not counted.
@@ -186,7 +188,8 @@ Initial open source release of the MCP Server Library for Zig.
 - Gitleaks allowlist configuration for test data
 - Apache-2.0 open source licensing
 
-[Unreleased]: https://gitlab.com/devnw/zig/mcp/-/compare/v0.1.24...HEAD
+[Unreleased]: https://gitlab.com/devnw/zig/mcp/-/compare/v0.1.25...HEAD
+[0.1.25]: https://gitlab.com/devnw/zig/mcp/-/compare/v0.1.24...v0.1.25
 [0.1.24]: https://gitlab.com/devnw/zig/mcp/-/compare/v0.1.23...v0.1.24
 [0.1.23]: https://gitlab.com/devnw/zig/mcp/-/compare/v0.1.22...v0.1.23
 [0.1.22]: https://gitlab.com/devnw/zig/mcp/-/compare/v0.1.21...v0.1.22
