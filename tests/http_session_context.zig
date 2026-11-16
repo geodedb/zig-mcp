@@ -210,3 +210,35 @@ test "a client that never finishes its request is answered 408 and dropped" {
     const sid = try f.connect();
     a.free(sid);
 }
+
+fn releaseLater(ref: mcp.SessionRef, released: *std.atomic.Value(bool)) void {
+    testIo().sleep(std.Io.Duration.fromMilliseconds(200), .awake) catch {};
+    released.store(true, .release);
+    ref.release();
+}
+
+test "Server.deinit waits for SessionRefs still held by other threads" {
+    const a = std.testing.allocator;
+    var f: Fixture = undefined;
+    try f.init(a, 0);
+
+    const sid = try f.connect();
+    defer a.free(sid);
+    var cap = try http.post(a, f.port, sid,
+        \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"capture"}}
+    );
+    cap.deinit(a);
+    const ref = f.handler.captured.?;
+    f.handler.captured = null;
+
+    // Another thread still holds the reference while the server shuts down.
+    var released = std.atomic.Value(bool).init(false);
+    const t = try std.Thread.spawn(.{}, releaseLater, .{ ref, &released });
+    defer t.join();
+
+    f.server.stop();
+    f.server.deinit();
+    // deinit returned only after the reference was released, so the
+    // release did not touch freed memory.
+    try std.testing.expect(released.load(.acquire));
+}
