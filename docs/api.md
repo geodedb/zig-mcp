@@ -151,6 +151,41 @@ with that allocator, never a string literal or a slice the handler keeps:
 error hands nothing over. Versions 0.1.12 to 0.1.21 freed only `callTool`
 results (and leaked the others); see CHANGELOG.md.
 
+#### Handler errors
+
+A callback reports a failure by returning an error; the error picks the
+JSON-RPC code. `error.ToolNotFound` and `error.PromptNotFound` are `-32602`
+(Invalid params) and `error.ResourceNotFound` is `-32002`, as MCP 2025-11-25
+specifies; `error.InvalidParams` is `-32602`, `error.MethodNotFound` is
+`-32601`, and any other error is `-32603`. The message defaults to the error
+name. To send a better message, or `data`, call `mcp.setErrorDetail` before
+returning the error:
+
+```zig
+const msg = try std.fmt.allocPrint(allocator, "Unknown tool: {s}", .{name});
+defer allocator.free(msg);
+try mcp.setErrorDetail(allocator, msg, null);
+return error.ToolNotFound;
+```
+
+`setErrorDetail(allocator, message, data_json)` copies both with
+`allocator`, and the server frees the copies. `data_json` must be one JSON
+value, such as `{"uri":"file:///x"}`, or `setErrorDetail` returns
+`error.InvalidErrorData`. The message and string ids are JSON-escaped in
+every response.
+
+The server never answers a notification (a message without an `id`), even
+when it fails. A `tools/call` request (string or integer id) is cancelled when
+the client sends `notifications/cancelled` for it: `cancel.isCancelled()`
+becomes true, and if the handler then returns `error.Cancelled` no response
+is sent. A request whose `id` is present but is not a string or an integer
+is answered with `-32600` (Invalid Request) and a null id.
+
+A successful result must be exactly one JSON value. The server re-serialises
+it without insignificant whitespace, so a pretty-printed result cannot break
+the newline-delimited stdio transport; a result that is not one JSON value is
+answered with `-32603` and the message `Invalid handler result`.
+
 ### Server Methods
 
 ```zig
