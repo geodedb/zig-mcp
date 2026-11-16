@@ -2979,6 +2979,37 @@ pub const Server = struct {
         for (results) |*r| {
             r.* = .{ .response = null, .index = 0 };
         }
+        errdefer for (results) |r| {
+            if (r.response) |resp| self.allocator.free(resp);
+        };
+
+        // SONNY-6644: reject duplicate request ids deterministically. The
+        // first request with an id, in batch order, is dispatched; every
+        // later request reusing it is answered with -32600 here and never
+        // dispatched, whatever order the pool would run them in.
+        const skip = try self.allocator.alloc(bool, items.len);
+        defer self.allocator.free(skip);
+        @memset(skip, false);
+        {
+            var seen_int: std.AutoHashMapUnmanaged(i64, void) = .empty;
+            defer seen_int.deinit(self.allocator);
+            var seen_str: std.StringHashMapUnmanaged(void) = .empty;
+            defer seen_str.deinit(self.allocator);
+            for (items, 0..) |item, i| {
+                const rid = batchRequestId(item) orelse continue;
+                const dup = switch (rid) {
+                    .int => |v| (try seen_int.getOrPut(self.allocator, v)).found_existing,
+                    .str => |v| (try seen_str.getOrPut(self.allocator, v)).found_existing,
+                };
+                if (dup) {
+                    skip[i] = true;
+                    results[i] = .{
+                        .response = try self.makeErrorResponse(rid, JsonRpcError.InvalidRequest, "Duplicate request id"),
+                        .index = i,
+                    };
+                }
+            }
+        }
 
         // Parallelism predicate — sequential when single item or parallelism
         // explicitly disabled. Otherwise lazily start the shared pool so
@@ -2999,6 +3030,7 @@ pub const Server = struct {
             // Sequential processing (single item, parallelism disabled, or
             // pool couldn't be created).
             for (items, 0..) |item, i| {
+                if (skip[i]) continue;
                 const response = try self.processJsonValue(item);
                 results[i] = .{ .response = response, .index = i };
             }
@@ -3028,21 +3060,24 @@ pub const Server = struct {
             const tasks = try self.allocator.alloc(tp.BatchTask, items.len);
             defer self.allocator.free(tasks);
 
+            var n_tasks: usize = 0;
             for (items, 0..) |item, i| {
-                ctxs[i] = .{ .server = self, .item = item, .index = i, .results = results };
-                tasks[i] = .{ .task_fn = ItemCtx.run, .ctx = &ctxs[i] };
+                if (skip[i]) continue;
+                ctxs[n_tasks] = .{ .server = self, .item = item, .index = i, .results = results };
+                tasks[n_tasks] = .{ .task_fn = ItemCtx.run, .ctx = &ctxs[n_tasks] };
+                n_tasks += 1;
             }
 
-            const result = try pool.submitBatch(tasks, .{ .wait_group = &wg });
+            const result = try pool.submitBatch(tasks[0..n_tasks], .{ .wait_group = &wg });
             wg.wait();
 
             // Any tasks the pool rejected under backpressure were never added
             // to the wait group and must be processed inline so their results
             // land in `results[]`.
-            if (result.submitted < items.len) {
-                for (items[result.submitted..], result.submitted..) |item, i| {
-                    const response = self.processJsonValue(item) catch null;
-                    results[i] = .{ .response = response, .index = i };
+            if (result.submitted < n_tasks) {
+                for (ctxs[result.submitted..n_tasks]) |c| {
+                    const response = self.processJsonValue(c.item) catch null;
+                    results[c.index] = .{ .response = response, .index = c.index };
                 }
             }
         }
@@ -3056,10 +3091,13 @@ pub const Server = struct {
 
         var all_notifications = true;
 
-        for (results) |result| {
+        for (results) |*result| {
             if (result.response) |resp| {
                 all_notifications = false;
                 try responses.append(self.allocator, resp);
+                // Now owned by `responses`; keep the errdefer above from
+                // freeing it a second time.
+                result.response = null;
             }
         }
 
@@ -3079,6 +3117,27 @@ pub const Server = struct {
         try buf.append(self.allocator, ']');
 
         return @as(?[]const u8, try buf.toOwnedSlice(self.allocator));
+    }
+
+    /// The id of a batch item that is a request (an object with a string
+    /// `method` and a string or integer `id`), or null for notifications,
+    /// client responses and malformed items, which carry no request id.
+    fn batchRequestId(item: json.Value) ?RequestId {
+        if (item != .obj) return null;
+        var id: ?RequestId = null;
+        var has_method = false;
+        for (item.obj) |m| {
+            if (std.mem.eql(u8, m.k, "method")) {
+                has_method = m.v == .str;
+            } else if (std.mem.eql(u8, m.k, "id")) {
+                id = switch (m.v) {
+                    .num => |n| if (std.fmt.parseInt(i64, n.lexeme, 10)) |v| .{ .int = v } else |_| null,
+                    .str => |str| .{ .str = str },
+                    else => null,
+                };
+            }
+        }
+        return if (has_method) id else null;
     }
 
     fn processSingleMessage(self: *Server, data: []const u8) !?[]const u8 {

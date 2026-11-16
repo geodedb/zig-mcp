@@ -183,6 +183,9 @@ answered with `-32603` and the message `Invalid handler result`.
 A second request that reuses the id of a request still in flight is answered
 with `-32600` ("Duplicate request id"); the first request is unaffected and
 stays cancellable. An id can be reused once its request has completed.
+Within one batch the rule is deterministic: the first request with an id, in
+batch order, runs, and every later request in the batch reusing that id gets
+`-32600` without being dispatched, sequential or on the worker pool.
 
 Server-to-client requests (`requestRoots`, `requestSampling`,
 `requestSamplingFull`, `requestElicitation`, `Session.request`) need the stdio
