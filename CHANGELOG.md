@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.23] - 2026-11-15
+
 ### Fixed
 
 - `error.ToolNotFound` and `error.PromptNotFound` are now answered with `-32602` (Invalid params), as MCP 2025-11-25 server/tools and server/prompts specify; they were `-32002`, the resource-not-found code (SONNY-6585). `error.ResourceNotFound` stays `-32002`.
@@ -166,7 +168,8 @@ Initial open source release of the MCP Server Library for Zig.
 - Gitleaks allowlist configuration for test data
 - Apache-2.0 open source licensing
 
-[Unreleased]: https://gitlab.com/devnw/zig/mcp/-/compare/v0.1.22...HEAD
+[Unreleased]: https://gitlab.com/devnw/zig/mcp/-/compare/v0.1.23...HEAD
+[0.1.23]: https://gitlab.com/devnw/zig/mcp/-/compare/v0.1.22...v0.1.23
 [0.1.22]: https://gitlab.com/devnw/zig/mcp/-/compare/v0.1.21...v0.1.22
 [0.1.21]: https://gitlab.com/devnw/zig/mcp/-/compare/v0.1.20...v0.1.21
 [0.1.20]: https://gitlab.com/devnw/zig/mcp/-/compare/v0.1.19...v0.1.20
