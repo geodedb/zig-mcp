@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.26] - 2026-11-15
+
+### Security
+
+- **The HTTP transport sent every server message to every SSE stream**, so one client could receive another client's notifications, log messages and server-to-client requests (SONNY-6644). Each Streamable HTTP client now has its own session, and messages go only to that client. `Last-Event-ID` replay drew on a buffer shared by all clients and now replays only the session's own events. Tasks were readable, listable and cancellable by any client and now belong to the session that created them (`Task.owner`).
+
+### Fixed
+
+- Streamable HTTP sessions (MCP 2025-11-25 basic/transports). `initialize` without `Mcp-Session-Id` creates a session with a stable random id; previously every response minted a new one. Requests other than `initialize` need the id (`400` without, `404` for an unknown, deleted or expired session). Initialization state, capabilities, request ids, cancellations and server-to-client requests are per session, so clients no longer collide on request ids or cancel each other's requests.
+- Server-to-client requests (`requestRoots`, `requestSampling`, `requestElicitation`) work over HTTP. They returned `error.NoSession` because only stdio created a `Session`. Messages sent while handling a POST go on that POST's SSE stream before the response; others go on the session's `GET` stream.
+- The `GET` SSE stream was closed as soon as it was registered, so later writes went to a closed and possibly reused descriptor. It now stays open until the client disconnects, the session ends or the server stops, and a new `GET` replaces the old stream.
+- HTTP connections were handled one at a time on the accept thread, so a request waiting for its client blocked everyone. Each connection now runs on its own thread (`http_max_connections`, default 64, then `503`), and `stop()` wakes and waits for them.
+- The request body was a single 8 KiB read with `Content-Length` ignored. The server now reads the full declared body, up to `max_message_bytes` (`413`) with headers up to 16 KiB (`431`), within `http_request_timeout_ms` (default 30 s, `408`).
+- `DELETE` closes the session's stream and fails its pending server-to-client requests. Sessions idle for `http_session_idle_timeout_ms` (default 30 minutes) with no open connection expire.
+- Tasks were never freed, and `updateTaskStatus` leaked the result it replaced.
+- `createTask` and `getTask` returned a pointer into the task hashmap after releasing its lock, so a later insert could leave the caller with a dangling pointer and a concurrent update raced its reads. They now return owned copies.
+- A `SessionRef` released after `Server.deinit` used freed memory. `deinit` now waits for outstanding references (up to `Server.session_ref_wait_ms`, 10 s) and panics with a clear message if one is still held.
+- The HTTP acceptance tests returned early (passed) on any connection, write or read error, and read only the first chunk of each response. They now fail on errors and read the whole response, which exposed a T5 failure the early return had hidden.
+
+### Added
+
+- `Server.retainCurrentSession() ?SessionRef`, `SessionRef.id()`/`release()`, and `Server.enterSession(ref) SessionScope` (`scope.exit()`), to reach a client later from any thread.
+- `ServerOptions.http_session_idle_timeout_ms`, `http_max_connections`, `http_request_timeout_ms`.
+
+### Changed
+
+- **Breaking:** `Server.createTask` returns `!Task` and `Server.getTask` returns `!?Task`, owned copies the caller frees with `task.deinit(server.allocator)`; they returned `*Task` and `?*Task`.
+- **Breaking for HTTP clients:** requests other than `initialize` without `Mcp-Session-Id` get `400` (Streamable HTTP "Session Management"). Session-scoped server messages (`emitLog`, `notifyProgress`, `notifyResourceUpdated`, `Session.notify`/`request`) sent with no session context, or over stdio with no stdout, fail with `error.NoSession` instead of being broadcast or silently dropped.
+
 ## [0.1.25] - 2026-11-15
 
 ### Fixed
@@ -188,7 +217,8 @@ Initial open source release of the MCP Server Library for Zig.
 - Gitleaks allowlist configuration for test data
 - Apache-2.0 open source licensing
 
-[Unreleased]: https://gitlab.com/devnw/zig/mcp/-/compare/v0.1.25...HEAD
+[Unreleased]: https://gitlab.com/devnw/zig/mcp/-/compare/v0.1.26...HEAD
+[0.1.26]: https://gitlab.com/devnw/zig/mcp/-/compare/v0.1.25...v0.1.26
 [0.1.25]: https://gitlab.com/devnw/zig/mcp/-/compare/v0.1.24...v0.1.25
 [0.1.24]: https://gitlab.com/devnw/zig/mcp/-/compare/v0.1.23...v0.1.24
 [0.1.23]: https://gitlab.com/devnw/zig/mcp/-/compare/v0.1.22...v0.1.23

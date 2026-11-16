@@ -431,6 +431,10 @@ pub fn build(b: *std.Build) void {
         "tests/fuzz_dispatch.zig",
         "tests/client_responses.zig",
         "tests/batch_duplicates.zig",
+        "tests/http_sessions.zig",
+        "tests/http_session_context.zig",
+        "tests/http_session_tasks.zig",
+        "tests/task_handles.zig",
     }) |path| {
         const errors_test_mod = b.createModule(.{
             .root_source_file = b.path(path),

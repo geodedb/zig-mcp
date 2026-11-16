@@ -1,6 +1,6 @@
 .{
     .name = .mcp,
-    .version = "0.1.25",
+    .version = "0.1.26",
     .fingerprint = 0xa19bc839041e107b,
     .minimum_zig_version = "0.15.0",
     .dependencies = .{
