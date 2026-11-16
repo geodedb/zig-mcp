@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.26] - 2026-11-15
+
 ### Security
 
 - **The HTTP transport sent every server message to every SSE stream**, so one client could receive another client's notifications, log messages and server-to-client requests (SONNY-6644). Each Streamable HTTP client now has its own session, and messages go only to that client. `Last-Event-ID` replay drew on a buffer shared by all clients and now replays only the session's own events. Tasks were readable, listable and cancellable by any client and now belong to the session that created them (`Task.owner`).
@@ -211,7 +213,8 @@ Initial open source release of the MCP Server Library for Zig.
 - Gitleaks allowlist configuration for test data
 - Apache-2.0 open source licensing
 
-[Unreleased]: https://gitlab.com/devnw/zig/mcp/-/compare/v0.1.25...HEAD
+[Unreleased]: https://gitlab.com/devnw/zig/mcp/-/compare/v0.1.26...HEAD
+[0.1.26]: https://gitlab.com/devnw/zig/mcp/-/compare/v0.1.25...v0.1.26
 [0.1.25]: https://gitlab.com/devnw/zig/mcp/-/compare/v0.1.24...v0.1.25
 [0.1.24]: https://gitlab.com/devnw/zig/mcp/-/compare/v0.1.23...v0.1.24
 [0.1.23]: https://gitlab.com/devnw/zig/mcp/-/compare/v0.1.22...v0.1.23
