@@ -1854,8 +1854,9 @@ threadlocal var dispatch_ctx: DispatchContext = .{};
 
 /// A counted reference to the Streamable HTTP client a handler is serving,
 /// from `Server.retainCurrentSession`. Pass it to `Server.enterSession` to
-/// send to that client later, from any thread. Release it when done, and
-/// before `Server.deinit`.
+/// send to that client later, from any thread. Release it when done.
+/// `Server.deinit` waits for outstanding references (up to
+/// `Server.session_ref_wait_ms`, then it panics).
 pub const SessionRef = struct {
     session: *HttpSession,
 
@@ -1865,7 +1866,10 @@ pub const SessionRef = struct {
     }
 
     pub fn release(self: SessionRef) void {
-        self.session.server.releaseHttpSession(self.session);
+        const server = self.session.server;
+        server.releaseHttpSession(self.session);
+        // Last: once the count drops, Server.deinit may proceed.
+        _ = server.session_refs.fetchSub(1, .acq_rel);
     }
 };
 
@@ -1931,6 +1935,8 @@ pub const Server = struct {
     http_conns: std.ArrayListUnmanaged(std.Io.net.Stream) = .empty,
     http_conns_mutex: std.Io.Mutex = std.Io.Mutex.init,
     http_connections: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    /// Outstanding `SessionRef`s; `deinit` waits for them (SONNY-6644).
+    session_refs: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
     // Cancellation and timeout tracking (GAP-024, GAP-005) for stdio and
     // direct processMessage; each HTTP session has its own.
@@ -2026,8 +2032,23 @@ pub const Server = struct {
         try self.startWorkers();
     }
 
+    /// How long `deinit` waits for outstanding `SessionRef`s before it
+    /// panics (a reference released later would touch freed memory).
+    pub const session_ref_wait_ms: u32 = 10_000;
+
+    /// Stops the server and frees it. Every `SessionRef` must be released
+    /// first: `deinit` waits up to `session_ref_wait_ms` for references other
+    /// threads still hold, then panics rather than free memory they use.
     pub fn deinit(self: *Server) void {
         self.stop();
+
+        var waited_ms: u32 = 0;
+        while (self.session_refs.load(.acquire) > 0) : (waited_ms += 1) {
+            if (waited_ms >= session_ref_wait_ms) {
+                std.debug.panic("mcp.Server.deinit: {d} SessionRef(s) still held after {d} ms; release every SessionRef before deinit", .{ self.session_refs.load(.acquire), session_ref_wait_ms });
+            }
+            io().sleep(std.Io.Duration.fromMilliseconds(1), .awake) catch {};
+        }
 
         // Shut down and destroy the owned thread pool before tearing down
         // sessions / SSE connections so any in-flight tasks still observing
@@ -2933,6 +2954,7 @@ pub const Server = struct {
         defer self.sessions_mutex.unlock(io());
         if (hs.closed) return null;
         hs.refs += 1;
+        _ = self.session_refs.fetchAdd(1, .acq_rel);
         return .{ .session = hs };
     }
 
