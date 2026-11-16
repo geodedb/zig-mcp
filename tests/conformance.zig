@@ -16,7 +16,7 @@ test "JSON-RPC: request must have jsonrpc field" {
     const invalid = "{\"id\":1,\"method\":\"test\"}";
 
     try expectValidRequest(valid);
-    try expectInvalidRequest(invalid);
+    try expectInvalidRequest(invalid, error.InvalidJsonRpc);
 }
 
 test "JSON-RPC: jsonrpc must be exactly 2.0" {
@@ -25,8 +25,8 @@ test "JSON-RPC: jsonrpc must be exactly 2.0" {
     const invalid_2_1 = "{\"jsonrpc\":\"2.1\",\"id\":1,\"method\":\"test\"}";
 
     try expectValidRequest(valid);
-    try expectInvalidRequest(invalid_1_0);
-    try expectInvalidRequest(invalid_2_1);
+    try expectInvalidRequest(invalid_1_0, error.InvalidJsonRpc);
+    try expectInvalidRequest(invalid_2_1, error.InvalidJsonRpc);
 }
 
 test "JSON-RPC: request must have method field" {
@@ -34,7 +34,7 @@ test "JSON-RPC: request must have method field" {
     const invalid = "{\"jsonrpc\":\"2.0\",\"id\":1}";
 
     try expectValidRequest(valid);
-    try expectInvalidRequest(invalid);
+    try expectInvalidRequest(invalid, error.InvalidMethod);
 }
 
 test "JSON-RPC: method must be string" {
@@ -42,7 +42,7 @@ test "JSON-RPC: method must be string" {
     const invalid = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":123}";
 
     try expectValidRequest(valid);
-    try expectInvalidRequest(invalid);
+    try expectInvalidRequest(invalid, error.InvalidMethod);
 }
 
 test "JSON-RPC: id can be string, number, or null" {
@@ -69,7 +69,7 @@ test "JSON-RPC: params must be object or array if present" {
     try expectValidRequest(params_object);
     try expectValidRequest(params_array);
     try expectValidRequest(no_params);
-    try expectInvalidRequest(invalid_params);
+    try expectInvalidRequest(invalid_params, error.InvalidParams);
 }
 
 test "JSON-RPC: response must have result or error, not both" {
@@ -79,7 +79,7 @@ test "JSON-RPC: response must have result or error, not both" {
 
     try expectValidResponse(valid_result);
     try expectValidResponse(valid_error);
-    try expectInvalidResponse(invalid_both);
+    try expectInvalidResponse(invalid_both, error.BothResultAndError);
 }
 
 test "JSON-RPC: error object must have code and message" {
@@ -88,8 +88,8 @@ test "JSON-RPC: error object must have code and message" {
     const missing_message = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32600}}";
 
     try expectValidResponse(valid);
-    try expectInvalidResponse(missing_code);
-    try expectInvalidResponse(missing_message);
+    try expectInvalidResponse(missing_code, error.InvalidErrorObject);
+    try expectInvalidResponse(missing_message, error.InvalidErrorObject);
 }
 
 test "JSON-RPC: error code must be integer" {
@@ -97,7 +97,7 @@ test "JSON-RPC: error code must be integer" {
     const invalid = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":\"-32600\",\"message\":\"Invalid\"}}";
 
     try expectValidResponse(valid);
-    try expectInvalidResponse(invalid);
+    try expectInvalidResponse(invalid, error.ErrorCodeNotInt);
 }
 
 // ============================================================================
@@ -417,9 +417,18 @@ fn expectValidRequest(input: []const u8) !void {
     }
 }
 
-fn expectInvalidRequest(input: []const u8) !void {
-    expectValidRequest(input) catch return;
-    return error.ExpectedInvalid;
+/// Passes only when `input` is rejected with exactly `expected`. A
+/// different rejection (for example a typo that makes the input unparseable)
+/// or no rejection fails the test, with the reason printed.
+fn expectInvalidRequest(input: []const u8, expected: anyerror) !void {
+    if (expectValidRequest(input)) |_| {
+        std.debug.print("expected {s} for request, but it was accepted: {s}\n", .{ @errorName(expected), input });
+        return error.TestExpectedInvalid;
+    } else |err| {
+        if (err == expected) return;
+        std.debug.print("expected {s} for request, got {s}: {s}\n", .{ @errorName(expected), @errorName(err), input });
+        return error.TestUnexpectedRejection;
+    }
 }
 
 fn expectValidNotification(input: []const u8) !void {
@@ -486,9 +495,16 @@ fn expectValidResponse(input: []const u8) !void {
     }
 }
 
-fn expectInvalidResponse(input: []const u8) !void {
-    expectValidResponse(input) catch return;
-    return error.ExpectedInvalid;
+/// Like `expectInvalidRequest`, for responses.
+fn expectInvalidResponse(input: []const u8, expected: anyerror) !void {
+    if (expectValidResponse(input)) |_| {
+        std.debug.print("expected {s} for response, but it was accepted: {s}\n", .{ @errorName(expected), input });
+        return error.TestExpectedInvalid;
+    } else |err| {
+        if (err == expected) return;
+        std.debug.print("expected {s} for response, got {s}: {s}\n", .{ @errorName(expected), @errorName(err), input });
+        return error.TestUnexpectedRejection;
+    }
 }
 
 fn expectValidMcpRequest(input: []const u8, expected_method: []const u8) !void {
@@ -565,4 +581,21 @@ fn expectErrorCode(code: i32, _: []const u8) !void {
     } else {
         return error.InvalidErrorCode;
     }
+}
+
+// ============================================================================
+// The invalid-input helpers must fail loudly
+// ============================================================================
+
+test "helpers: an invalid input rejected for the wrong reason fails the test" {
+    // Malformed JSON is rejected, but not because the method is missing.
+    try std.testing.expectError(error.TestUnexpectedRejection, expectInvalidRequest("{not json", error.InvalidMethod));
+    // A valid request is not rejected at all.
+    try std.testing.expectError(error.TestExpectedInvalid, expectInvalidRequest(
+        \\{"jsonrpc":"2.0","id":1,"method":"m"}
+    , error.InvalidMethod));
+    try std.testing.expectError(error.TestUnexpectedRejection, expectInvalidResponse("[1,", error.BothResultAndError));
+    try std.testing.expectError(error.TestExpectedInvalid, expectInvalidResponse(
+        \\{"jsonrpc":"2.0","id":1,"result":{}}
+    , error.BothResultAndError));
 }
