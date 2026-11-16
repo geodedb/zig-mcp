@@ -40,6 +40,15 @@ fn testConnect(port: u16) !std.Io.net.Stream {
 // Test Helpers
 // ============================================================================
 
+const http_ping_body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}";
+const http_initialize_body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"t\",\"version\":\"1\"}}}";
+
+/// A raw POST /mcp request with a correct Content-Length.
+fn httpPost(comptime extra_headers: []const u8, comptime body: []const u8) []const u8 {
+    return "POST /mcp HTTP/1.1\r\nHost: localhost\r\n" ++ extra_headers ++
+        "Content-Type: application/json\r\nContent-Length: " ++ std.fmt.comptimePrint("{d}", .{body.len}) ++ "\r\n\r\n" ++ body;
+}
+
 fn parseJsonResponse(allocator: std.mem.Allocator, response: []const u8) !json.Document {
     var err = json.ParseError.init();
     return json.parse(allocator, response, .{}, &err);
@@ -357,7 +366,7 @@ test "T4: HTTP bearer auth" {
         };
         defer testStreamClose(stream);
 
-        const request = "POST /mcp HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 41\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}";
+        const request = httpPost("", http_ping_body);
         testStreamWriteAll(stream, request) catch return;
 
         var buf: [1024]u8 = undefined;
@@ -372,8 +381,9 @@ test "T4: HTTP bearer auth" {
         const stream = testConnect(port) catch return;
         defer testStreamClose(stream);
 
-        var req_buf: [512]u8 = undefined;
-        const request = std.fmt.bufPrint(&req_buf, "POST /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {s}\r\nContent-Type: application/json\r\nContent-Length: 41\r\n\r\n{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}}", .{test_token}) catch return;
+        // Sessions start at initialize (Streamable HTTP); a session-less
+        // ping is 400 since SONNY-6644.
+        const request = httpPost("Authorization: Bearer " ++ test_token ++ "\r\n", http_initialize_body);
 
         testStreamWriteAll(stream, request) catch return;
 
@@ -739,7 +749,7 @@ test "Origin header validation" {
         const stream = testConnect(port) catch return;
         defer testStreamClose(stream);
 
-        const request = "POST /mcp HTTP/1.1\r\nHost: localhost\r\nOrigin: http://evil.example.com\r\nContent-Type: application/json\r\nContent-Length: 41\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}";
+        const request = httpPost("Origin: http://evil.example.com\r\n", http_ping_body);
         testStreamWriteAll(stream, request) catch return;
 
         var buf: [1024]u8 = undefined;
@@ -755,7 +765,7 @@ test "Origin header validation" {
         const stream = testConnect(port) catch return;
         defer testStreamClose(stream);
 
-        const request = "POST /mcp HTTP/1.1\r\nHost: localhost\r\nOrigin: http://allowed.example.com\r\nContent-Type: application/json\r\nContent-Length: 41\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}";
+        const request = httpPost("Origin: http://allowed.example.com\r\n", http_initialize_body);
         testStreamWriteAll(stream, request) catch return;
 
         var buf: [1024]u8 = undefined;
@@ -1015,7 +1025,7 @@ test "MCP-Protocol-Version header in response" {
     const stream = testConnect(port) catch return;
     defer testStreamClose(stream);
 
-    const request = "POST /mcp HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 41\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}";
+    const request = httpPost("", http_initialize_body);
     testStreamWriteAll(stream, request) catch return;
 
     var buf: [2048]u8 = undefined;

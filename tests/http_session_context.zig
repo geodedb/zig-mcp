@@ -189,3 +189,24 @@ test "idle sessions expire and their id gets 404" {
         try std.testing.expectEqual(@as(u16, 200), p.status);
     }
 }
+
+test "a client that never finishes its request is answered 408 and dropped" {
+    const a = std.testing.allocator;
+    var f: Fixture = undefined;
+    try f.init(a, 0);
+    defer f.deinit();
+    f.server.options.http_request_timeout_ms = 200;
+
+    // Promises a 10-byte body and never sends it.
+    var conn = try http.Conn.open(a, f.port);
+    defer conn.close();
+    try conn.send("POST /mcp HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 10\r\n\r\n");
+    var head = try conn.readHead(3000);
+    defer head.deinit(a);
+    try std.testing.expectEqual(@as(u16, 408), head.status);
+    try std.testing.expect(try conn.closedWithin(3000));
+
+    // Other clients are unaffected.
+    const sid = try f.connect();
+    a.free(sid);
+}
